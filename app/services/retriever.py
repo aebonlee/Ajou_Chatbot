@@ -12,7 +12,6 @@ import math
 import numpy as np
 from rank_bm25 import BM25Okapi
 from collections import defaultdict
-from sentence_transformers import CrossEncoder
 from .storage import get_client, get_collection, get_all
 from .textutil import tokenize_ko, normalize_numbers, path_of
 from app.core import config  # 전역 스위치 사용
@@ -72,31 +71,60 @@ def _bm25_rank(scope_idx: List[int], all_docs: List[str], query: str, topn: int)
     return {gi: float(s) for gi, s in top_pairs}
 
 def _dense(col, all_ids: List[str], where: Optional[Dict[str, Any]], q: str, ndense: int) -> Dict[int, float]:
+    """
+    Chroma dense 검색 → cosine distance 기준(작을수록 유사).
+    - similarity = 1 - distance 로 변환 후 [0, 1]로 클램핑.
+    - ids는 include에 넣지 말 것(Chroma가 기본으로 반환함).
+    - all_ids → 인덱스 매핑 딕셔너리로 O(1) 매칭.
+    """
     if ndense <= 0:
         return {}
+
     try:
         res = col.query(
             query_texts=[q],
             n_results=int(ndense),
             where=where or None,
-            include=["distances", "documents", "metadatas"],
+            # ⚠️ 'ids'는 include 대상이 아님. 기본으로 항상 반환됨.
+            include=["distances", "metadatas"],   # documents는 굳이 안 받아도 됨
         )
-    except Exception:
+    except Exception as e:
+        # 필요하면 debug 로깅
+        # print(f"[dense] query error: {e}")
         return {}
 
-    ids = res.get("ids", [[]])[0] if res else []
-    dists = res.get("distances", [[]])[0] if res else []
+    # 안전 파싱
+    ids_list = res.get("ids") or []
+    dists_list = res.get("distances") or []
+    if not ids_list or not dists_list:
+        return {}
+
+    ids = ids_list[0] if isinstance(ids_list[0], (list, tuple)) else ids_list
+    dists = dists_list[0] if isinstance(dists_list[0], (list, tuple)) else dists_list
+    if not ids or not dists:
+        return {}
+
+    # O(1) 매칭을 위한 id→글로벌인덱스 맵
+    id2gi = {cid: gi for gi, cid in enumerate(all_ids)}
+
     out: Dict[int, float] = {}
     for cid, d in zip(ids, dists):
-        try:
-            gi = all_ids.index(cid)
-        except ValueError:
+        gi = id2gi.get(cid)
+        if gi is None:
             continue
-        sim = 1.0 - float(d)
+        # 거리 → 유사도 변환
+        try:
+            sim = 1.0 - float(d)
+        except Exception:
+            sim = 0.0
         if not math.isfinite(sim):
             sim = 0.0
         sim = max(0.0, min(1.0, sim))
-        out[gi] = max(out.get(gi, 0.0), sim)
+        # 동일 gi가 여러 번 나오면 최대값 유지
+        prev = out.get(gi, 0.0)
+        if sim > prev:
+            out[gi] = sim
+
     return out
 
 # -----------------------------
