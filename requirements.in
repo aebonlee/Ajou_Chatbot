@@ -1,0 +1,20 @@
+# Web
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# RAG / Vector
+chromadb
+sentence-transformers
+rank-bm25
+kiwipiepy
+numpy
+
+# LangChain / Graph / Providers
+langchain-core
+langgraph
+langchain-openai
+langchain-anthropic
+openai
+anthropic

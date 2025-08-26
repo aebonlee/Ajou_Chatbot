@@ -1,4 +1,3 @@
-# app/main.py
 """
 CLI 유틸:
 - ingest: data/<college>/<dept>/*.md 색인

@@ -1,4 +1,3 @@
-# app/graphs/nodes.py
 """
 LangGraph 노드 정의:
 - parse_intent: (LLM 우선) 단과대/학과 추출 + 마이크로 모드 결정

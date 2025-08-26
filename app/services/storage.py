@@ -9,7 +9,7 @@ import chromadb
 from chromadb.api.models.Collection import Collection
 from chromadb.utils import embedding_functions
 
-# ✅ 기본 임베딩을 bge-m3로
+# 기본 임베딩: bge-m3
 DEFAULT_EMBEDDING = "BAAI/bge-m3"
 
 def get_client(persist_dir: str) -> chromadb.PersistentClient:

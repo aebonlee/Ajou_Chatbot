@@ -1,7 +1,6 @@
-# app/graphs/nodes_classify.py
 """
 질문 라우팅(분류) 노드:
-- 1차: 휴리스틱(초저지연)
+- 1차: 휴리스틱(초저지연, LLM 토큰소모 줄이기용)
 - 2차: LLM 구조화 분류(애매/다중의도/other일 때만)
 - policy: 특정 카테고리는 고정응답으로 즉시 종료 (RAG 스킵)
 """
@@ -66,7 +65,7 @@ def _apply_category_overrides(state: Dict[str, Any], category: str) -> None:
     opts = state.setdefault("opts", {})
     for k, v in cfg.items():
         if k == "micro_mode":
-            opts[k] = v  # ✅ 항상 덮어쓰기
+            opts[k] = v
         else:
             if opts.get(k) is None:
                 opts[k] = v
@@ -122,7 +121,7 @@ def _fixed_answer(category: str) -> str:
     if category == "rule_info":
         return (
             "학칙/규정 관련 문의네요. 이 질문은 별도의 규정 인용 파이프라인으로 처리하고 있어요.\n"
-            "정확한 조항 인용이 필요하므로, 잠시 후 규정 검색 결과를 바탕으로 안내해 드릴게요."
+            "이쪽의 내용에 관해서는 학사 공통 정보 파이프라인 쪽에 질문해 주시면 친절히 답변해 드릴게요🙂."
         )
     return ""
 

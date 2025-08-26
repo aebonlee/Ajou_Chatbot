@@ -2,8 +2,8 @@
 폴더 트리 인덱서:
 - 입력: data/<college>/<dept>/*.md
 - 처리: H1/H2/H4 단위로 청크 쪼개기, [PATH] 헤더 삽입, 메타필드 저장
-- ✅ 긴 섹션은 1200자 윈도우/200자 오버랩으로 분할
-- ✅ 인접 중복 라인 제거로 노이즈 축소
+- 긴 섹션은 1200자 윈도우/200자 오버랩으로 분할
+- 인접 중복 라인 제거로 노이즈 축소
 """
 import os, uuid, glob, re
 from typing import List, Dict, Optional, Tuple

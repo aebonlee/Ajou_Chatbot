@@ -12,10 +12,10 @@ import math
 import numpy as np
 from rank_bm25 import BM25Okapi
 from collections import defaultdict
-
+from sentence_transformers import CrossEncoder
 from .storage import get_client, get_collection, get_all
 from .textutil import tokenize_ko, normalize_numbers, path_of
-from app.core import config  # ✅ 전역 스위치 사용
+from app.core import config  # 전역 스위치 사용
 
 EPS = 1e-9
 
@@ -215,7 +215,7 @@ def _single_scope_retrieve(
     scope_depts: Optional[List[str]], micro_mode: str, debug: bool,
     rerank: bool = True, rerank_model: str = "BAAI/bge-reranker-v2-m3",
     rerank_candidates: int = 40,
-    stitch_by_path: bool = False,   # ✅ 추가
+    stitch_by_path: bool = False,
 ) -> List[Dict[str, Any]]:
     client = get_client(persist_dir)
     col = get_collection(client, collection, embedding_model)
@@ -306,7 +306,7 @@ def _single_scope_retrieve(
         rescored.append((gi, sc2))
     rescored.sort(key=lambda x: x[1], reverse=True)
 
-    # ✅ 스티칭 옵션
+    # 스티칭 옵션(지금은 일단 사용안하는중)
     if stitch_by_path:
         hits = _stitch_by_path(
             rescored,
@@ -351,7 +351,7 @@ def retrieve(
     rerank: bool = True,
     rerank_model: str = "BAAI/bge-reranker-v2-m3",
     rerank_candidates: int = 40,
-    stitch_by_path: bool = False,   # ✅ 추가
+    stitch_by_path: bool = False,
 ) -> List[Dict[str, Any]]:
     mm = micro_mode or detect_micro_mode(question)
 
@@ -372,7 +372,7 @@ def retrieve(
                 rerank=rerank,
                 rerank_model=rerank_model,
                 rerank_candidates=rerank_candidates,
-                stitch_by_path=stitch_by_path,   # ✅ 전달
+                stitch_by_path=stitch_by_path,
             ))
         scores: Dict[str, float] = {}
         by_id: Dict[str, Dict[str, Any]] = {}
@@ -397,5 +397,5 @@ def retrieve(
         rerank=rerank,
         rerank_model=rerank_model,
         rerank_candidates=rerank_candidates,
-        stitch_by_path=stitch_by_path,   # ✅ 전달
+        stitch_by_path=stitch_by_path,
     )
