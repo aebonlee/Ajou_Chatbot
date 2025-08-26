@@ -161,7 +161,7 @@ def node_classify(state: Dict[str, Any]) -> Dict[str, Any]:
     state["category"] = chosen
     state["style_guide"] = STYLE_GUIDES.get(chosen, STYLE_GUIDES["other"])
 
-    # ✅ 카테고리별 파라미터 오버라이드 적용
+    # 카테고리별 파라미터 오버라이드 적용
     _apply_category_overrides(state, chosen)
 
     # 고정 응답 정책: RAG 스킵
