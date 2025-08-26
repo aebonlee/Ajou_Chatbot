@@ -77,7 +77,6 @@ overrides==7.7.0
 packaging==25.0
 posthog==5.4.0
 propcache==0.3.2
-protobuf==6.31.1
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pybase64==1.4.2
@@ -85,7 +84,6 @@ pydantic==2.11.7
 pydantic-settings==2.10.1
 pydantic_core==2.33.2
 Pygments==2.19.2
-pypdf==6.0.0
 PyPika==0.48.9
 pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0
