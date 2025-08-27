@@ -168,7 +168,7 @@ def _make_llm(model_name: str, temperature: float, max_tokens: int):
     if provider == "anthropic":
         if ChatAnthropic is None:
             raise RuntimeError("langchain-anthropic 미설치 또는 로드 실패")
-        return ChatAnthropic(model=model_name, temperature=temperature, max_tokens=max_tokens)
+        return ChatAnthropic(model_name=model_name, temperature=temperature, timeout=None, stop=None)
     else:
         if ChatOpenAI is None:
             raise RuntimeError("langchain-openai 미설치 또는 로드 실패")
