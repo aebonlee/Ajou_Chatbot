@@ -1,437 +1,123 @@
-# app/graphs/nodes.py
-from typing import List, Dict, Any
-import json, re, random
-
-try:
-    from langchain_openai import ChatOpenAI
-except Exception:
-    ChatOpenAI = None
-try:
-    from langchain_anthropic import ChatAnthropic
-except Exception:
-    ChatAnthropic = None
+from typing import Dict, Any, List, Literal
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-
+from pydantic import BaseModel, Field
 from app.core import config
-from app.models.schemas import QuerySchema
-from app.services.retriever import retrieve
-from app.services.textutil import term_sort_key
 
-
-# ==================== 인사말 템플릿 & 토픽 추출 ====================
-
-INTRO_TEMPLATES_WITH_TOPIC = [
-    "{topic} 관련 핵심만 정리해 드릴게요.",
-    "{topic} 질문 주셔서 감사합니다. 요점만 안내드릴게요.",
-    "{topic}에 대해 물어보셨네요. 바로 정리해 드립니다.",
-    "좋은 질문이에요—{topic} 기준으로 안내드릴게요.",
-    "{topic}: 아래에 한눈에 보이게 정리했어요.",
-    "{topic} 중심으로 필요한 것만 깔끔히 정리했습니다.",
+Category = Literal[
+    "major_list","major_detail","micro_list","micro_detail","course_detail",
+    "term_plan","track_rules","general_info","rule_info","practice_capstone",
+    "area_compare","other"
 ]
 
-INTRO_TEMPLATES_GENERIC = [
-    "좋은 질문이에요! 아래에 핵심만 정리해 드릴게요.",
-    "문의 감사합니다. 요점만 빠르게 정리해 드립니다.",
-    "바로 핵심만 안내드릴게요.",
-]
+STYLE_GUIDES = {
+  "major_list":   "전공/학과명만 간단히 나열하고 세부 과목/학점은 넣지 마세요.",
+  "major_detail": "졸업요건/총 이수학점 위주로 요약하고 과목 나열은 1~2개 예시로 제한하세요.",
+  "micro_list":   "마이크로전공명만 나열하고 각 전공은 1문장 특징만 요약하세요.",
+  "micro_detail": "마이크로전공별 이수학점, 핵심 필수 1과목, 특징 1줄로 요약하세요.",
+  "course_detail":"과목명, 학점, 선수과목만 요약하세요. 불필요한 배경 설명은 생략.",
+  "general_info": "학과 소개/위치/연락처 등 핵심 정보를 간결히 설명하세요.",
+  "rule_info":    "규정·학칙을 인용하고 반드시 출처를 명시하세요.",
+  "term_plan":    "학년/학기별 추천 이수 순서를 간단한 불릿으로만 제시하세요.",
+  "practice_capstone":"현장실습/인턴/캡스톤 안내를 간단히 설명하고 최신 공지는 학과 공지로 유도하세요.",
+  "area_compare": "각 영역을 1~2문장으로 비교 요약하고 장단점을 균형 있게 적어주세요.",
+  "other":        "질문 맥락에 맞춰 자연스럽게 답하되 불필요한 나열은 피하세요.",
+}
 
-_KOR_WS = re.compile(r"\s+")
-_DEPT_PAT = re.compile(r"([가-힣A-Za-z0-9]+학과)")
-_TERM_PAT = re.compile(r"([1-4])\s*학\s*년(?:\s*([1-2])\s*학\s*기)?")
-_KEYWORDS = [
-    "전공필수", "졸업요건", "졸업 이수학점", "이수학점", "권장 이수", "교육과정",
-    "과목", "선수과목", "BSM", "학기별", "로드맵", "전공기초", "영어강의",
-]
+CATEGORY_CONFIG: Dict[str, Dict[str, Any]] = {
+    "major_list":     {"lex_weight": 0.9,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 20000,  "max_ctx_chunks": 4, "max_tokens": 900},
+    "major_detail":   {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 7000,   "max_ctx_chunks": 6, "max_tokens": 1200},
+    "micro_list":     {"lex_weight": 0.9,  "micro_mode": "only",    "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 12000,  "max_ctx_chunks": 4, "max_tokens": 800},
+    "micro_detail":   {"lex_weight": 0.8,  "micro_mode": "only",    "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 15000,  "max_ctx_chunks": 5, "max_tokens": 1000},
+    "course_detail":  {"lex_weight": 0.7,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 5000,   "max_ctx_chunks": 5, "max_tokens": 900},
+    "term_plan":      {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 6000,   "max_ctx_chunks": 6, "max_tokens": 1100},
+    "track_rules":    {"lex_weight": 0.75, "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 12000,  "max_ctx_chunks": 5, "max_tokens": 900},
+    "general_info":   {"lex_weight": 0.9,  "micro_mode": "exclude", "rerank": False,                         "assemble_budget_chars": 12000,  "max_ctx_chunks": 4, "max_tokens": 900},
+    "rule_info":      {"lex_weight": 0.7,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 1000},
+    "practice_capstone":{"lex_weight":0.8, "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 12000,  "max_ctx_chunks": 5, "max_tokens": 900},
+    "area_compare":   {"lex_weight": 0.85, "micro_mode": "include", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 1000},
+    "other":          {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 1000},
+}
 
-def _compact_spaces(s: str) -> str:
-    return _KOR_WS.sub(" ", (s or "").strip())
-
-def _trim_topic(topic: str, max_len: int = 22) -> str:
-    t = topic.strip(" \n\t-–—:·,.\"'“”‘’")
-    if len(t) <= max_len:
-        return t
-    return t[:max_len-1] + "…"
-
-def _extract_topic(question: str, state: Dict[str, Any]) -> str:
-    """
-    질문에서 짧은 키워드 토픽을 뽑아낸다.
-    우선순위:
-      1) scope_depts/LLM 파싱 결과의 departments
-      2) 질문에서 'OO학과' 패턴
-      3) 학년/학기 & 주요 키워드 결합
-      4) 주요 키워드 단독
-    """
-    q = _compact_spaces(question or "")
-
-    # 1) 요청 힌트/파싱 결과로 들어온 학과
-    depts = []
-    try:
-        depts = list(state.get("context_struct", {}).get("departments") or []) \
-                or list(state.get("opts", {}).get("scope_depts") or [])
-    except Exception:
-        depts = []
-    dept_name = (depts[0] if depts else "")
-
-    # 2) 질문에서 'OO학과' 직접 추출
-    if not dept_name:
-        m_dept = _DEPT_PAT.search(q)
-        if m_dept:
-            dept_name = m_dept.group(1)
-
-    # 3) 학년/학기 추출
-    term_txt = ""
-    m_term = _TERM_PAT.search(q)
-    if m_term:
-        y = m_term.group(1)
-        s = m_term.group(2)
-        if y and s:
-            term_txt = f"{y}학년 {s}학기"
-        elif y:
-            term_txt = f"{y}학년"
-
-    # 4) 주요 키워드 스캔
-    hits = [kw for kw in _KEYWORDS if kw in q]
-    key_part = " · ".join(hits[:2]) if hits else ""
-
-    # 조립 규칙
-    parts = [p for p in [dept_name, term_txt, key_part] if p]
-    if parts:
-        topic = " | ".join(parts) if (len(parts) >= 2) else parts[0]
-        return _trim_topic(topic)
-
-    # 마지막 폴백(질문 축약)
-    fallback = re.sub(r"[\"'“”‘’]", "", q)
-    fallback = re.sub(r"(에 대해|만|으로|는|은|이|가|을|를|요)$", "", fallback)
-    return _trim_topic(fallback) if fallback else ""
-
-def _pick_intro(question: str, state: Dict[str, Any]) -> str:
-    topic = _extract_topic(question, state)
-    if topic:
-        tpl = random.choice(INTRO_TEMPLATES_WITH_TOPIC)
-        return tpl.format(topic=topic)
-    return random.choice(INTRO_TEMPLATES_GENERIC)
-
-
-# ==================== 공용 유틸 ====================
-
-def _safe_path(h: Dict[str, Any]) -> str:
-    return (h.get("path")
-            or (h.get("metadata") or {}).get("path")
-            or "").strip()
-
-def _dedup_lines(text: str) -> str:
-    out, prev = [], None
-    for ln in (text or "").splitlines():
-        cur = ln.strip()
-        if cur and cur == prev:
-            continue
-        out.append(ln)
-        prev = cur
-    return "\n".join(out)
-
-def _summarize_sources(hits: List[Dict[str, Any]], max_items: int = 8) -> str:
-    if not hits:
-        return "(없음)"
-    lines = []
-    for i, h in enumerate(hits[:max_items], 1):
-        lines.append(f"{i}. {_safe_path(h)}")
-    return "\n".join(lines)
-
-def _build_context_from_hits(hits: List[Dict[str, Any]], *, max_items: int, budget_chars: int) -> str:
-    if not hits:
-        return ""
-    # 연/학기 우선 정렬(메타가 있으면)
-    def _ord(h):
-        m = h.get("metadata") or {}
-        y, s = m.get("year"), m.get("semester")
-        return (0, *term_sort_key(y, s)) if (y or s) else (1, 99, 99)
-    hits = sorted(hits, key=_ord)
-
-    parts: List[str] = []
-    used = 0
-    for i, h in enumerate(hits[:max_items], 1):
-        path = _safe_path(h)
-        body = _dedup_lines(h.get("document") or "")
-        block = f"[SOURCE {i}] {path}\n{body}\n"
-        blen = len(block)
-        if used + blen > budget_chars:
-            remain = budget_chars - used
-            if remain > 200:  # 최소한의 컨텍스트 보장
-                parts.append(block[:remain])
-            break
-        parts.append(block)
-        used += blen
-    return "\n\n---\n\n".join(parts)
-
-def _make_llm(model_name: str, temperature: float, max_tokens: int):
-    provider = config.llm_provider_from_model(model_name)
-    if provider == "anthropic":
-        if ChatAnthropic is None:
-            raise RuntimeError("langchain-anthropic 미설치 또는 로드 실패")
-        return ChatAnthropic(model=model_name, temperature=temperature, max_tokens=max_tokens)
-    else:
-        if ChatOpenAI is None:
-            raise RuntimeError("langchain-openai 미설치 또는 로드 실패")
-        return ChatOpenAI(model=model_name, temperature=temperature, max_tokens=max_tokens)
-
-
-# ==================== 그래프 노드 ====================
-
-def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
-    q = state["question"]
-    use_llm = bool(state["opts"].get("use_llm", True))
-    hints_depts = state["opts"].get("scope_depts") or []
-
-    if "micro_mode" not in state["opts"]:
-        state["opts"]["micro_mode"] = None
-
-    if not use_llm:
-        state["context_struct"] = {"faculties": [], "departments": hints_depts, "year": None, "need_slots": []}
-        return state
-
-    try:
-        model_name = state["opts"].get("model_name", config.LLM_MODEL)
-        llm = _make_llm(model_name=model_name,
-                        temperature=float(state["opts"].get("temperature") or 0.0),
-                        max_tokens=int(state["opts"].get("max_tokens") or 400))  # 증가
-        provider = config.llm_provider_from_model(model_name)
-        if provider == "anthropic":
-            sys = ("너는 대학 학사요람 Q&A용 추출기야. "
-                   "입력 질문에서 단과대/학과/학년도/필요 슬롯을 JSON으로만 출력해. "
-                   '반드시 {"faculties":[],"departments":[],"year":null,"need_slots":[]} 키를 사용.')
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", sys),
-                ("user", "질문: {q}\nJSON만 출력: faculties, departments, year, need_slots"),
-            ])
-            out = llm.invoke(prompt.format_messages(q=q))
-            raw = (out.content or "").strip()
-            parsed = None
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                m = re.search(r"\{.*\}", raw, re.S)
-                if m:
-                    parsed = json.loads(m.group(0))
-            if isinstance(parsed, dict):
-                qs = QuerySchema(
-                    faculties=parsed.get("faculties") or [],
-                    departments=parsed.get("departments") or [],
-                    year=parsed.get("year"),
-                    need_slots=parsed.get("need_slots") or [],
-                )
-            else:
-                raise ValueError("parse_intent: JSON 파싱 실패(Claude)")
+def _apply_category_overrides(state: Dict[str, Any], category: str) -> None:
+    cfg = CATEGORY_CONFIG.get(category, {})
+    if not cfg: return
+    opts = state.setdefault("opts", {})
+    for k, v in cfg.items():
+        if k == "micro_mode":
+            opts[k] = v
         else:
-            sys = "너는 대학 학사요람 Q&A용 추출기다. 입력에서 단과대/학과/학년도/필요 슬롯을 구조화해라."
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", sys),
-                ("user", "질문: {q}\n출력은 JSON으로. keys: faculties, departments, year, need_slots"),
-            ])
-            out = llm.with_structured_output(QuerySchema).invoke(prompt.format_messages(q=q))
-            qs = out
+            if opts.get(k) is None:
+                opts[k] = v
 
-        depts_union = list({*(qs.departments or []), *hints_depts})
-        state["context_struct"] = {
-            "faculties": list(qs.faculties or []),
-            "departments": depts_union,
-            "year": qs.year,
-            "need_slots": list(qs.need_slots or []),
-        }
-        return state
-    except Exception:
-        state["context_struct"] = {"faculties": [], "departments": hints_depts, "year": None, "need_slots": []}
-        return state
+def _heuristic(q: str) -> str:
+    s = q.replace(" ", "").lower()
+    if any(k in s for k in ["학과목록","전공목록","무슨학과","학과있","전공있"]): return "major_list"
+    if any(k in s for k in ["졸업요건","총이수","권장이수","교육과정","로드맵"]): return "major_detail"
+    if "마이크로전공" in s and any(k in s for k in ["뭐","무엇","종류","목록","리스트"]): return "micro_list"
+    if "마이크로전공" in s: return "micro_detail"
+    if any(k in s for k in ["과목","선수","수업","영어강의","코드","학점","개설학기"]): return "course_detail"
+    if any(k in s for k in ["학기별","권장순서","1학기","2학기","학년","무슨과목","뭐들어야","수강"]): return "term_plan"
+    if any(k in s for k in ["복수전공","부전공","연계전공","융합전공","전과"]): return "track_rules"
+    if any(k in s for k in ["학과소개","연락처","위치","교수","사무실"]): return "general_info"
+    if any(k in s for k in ["학칙","규정","조항","제","정원","평점","재수강"]): return "rule_info"
+    if any(k in s for k in ["캡스톤","현장실습","인턴","졸업작품"]): return "practice_capstone"
+    if any(k in s for k in ["영역","비교","추천","트랙","로드맵"]): return "area_compare"
+    return "other"
 
+class RouteSchema(BaseModel):
+    primary: Category
+    secondary: List[Category] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
 
-def node_need_more(state: Dict[str, Any]) -> Dict[str, Any]:
-    if not bool(state["opts"].get("use_llm", True)):
-        state["needs_clarification"] = False
-        return state
-    ctx = state["context_struct"]
-    if not ctx.get("departments") and not ctx.get("faculties"):
-        state["needs_clarification"] = True
-        state["clarification_prompt"] = "어느 학과(또는 전공) 기준인지 알려주세요. 예) 디지털미디어학과 / 소프트웨어학과"
-    else:
-        state["needs_clarification"] = False
-    return state
+ROUTER_SYSTEM = (
+    "너는 대학 학사안내 질문을 카테고리로 분류하는 라우터야.\n"
+    "가능한 카테고리: major_list, major_detail, micro_list, micro_detail, course_detail,\n"
+    "term_plan, track_rules, general_info, rule_info, practice_capstone, area_compare, other\n\n"
+    "규칙:\n"
+    "- 질문에 가장 적합한 1개를 primary로 고르고, 추가로 해당될 수 있는 것들을 secondary에 넣을 것.\n"
+    "- 신입생 자연어/오타/우회표현을 고려할 것.\n"
+    "- '무슨 과목', '뭐 들어야', '수강' 등은 term_plan으로 분류.\n"
+    "- 신청/절차/포탈 관련이면 'track_rules'. 캡스톤/인턴/현장실습/졸업작품은 'practice_capstone'.\n"
+    "- 학칙/규정/조항/정원/재수강 등 제도 인용은 'rule_info'.\n"
+    "- 확신도가 낮으면 confidence를 낮게."
+)
 
+def _fixed_answer(category: str) -> str:
+    if category == "practice_capstone":
+        return ("캡스톤·인턴·현장실습·졸업작품 관련 모집은 보통 **학기 시작 전 사전 신청**으로 진행됩니다.\n"
+                "최신 일정은 각 학과 공지사항을 확인하거나 학과 사무실로 문의해 주세요.")
+    if category == "track_rules":
+        return ("복수전공/부전공/연계·융합전공/전과 신청은 **아주대학교 포탈(학사서비스)**에서 진행됩니다.\n"
+                "세부 요건과 선발 기준은 소속 단과대·학과 공지를 함께 확인해 주세요.")
+    if category == "rule_info":
+        return ("학칙/규정에 관한 문의입니다. 공통 학사 규정 페이지를 함께 확인하시면 정확합니다.")
+    return ""
 
-def node_retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
-    if state.get("needs_clarification") or state.get("error") or state.get("skip_rag"):
-        state["retrieved"] = []
-        return state
-    ctx = state["context_struct"]
-    opts = state["opts"]
-    try:
-        hits = retrieve(
-            state["question"],
-            persist_dir=opts["persist_dir"], collection=opts["collection"], embedding_model=opts["embedding_model"],
-            topk=int(opts.get("topk") or config.TOPK),
-            lex_weight=float(opts.get("lex_weight") or config.LEX_WEIGHT),
-            scope_colleges=(ctx.get("faculties") or None),
-            scope_depts=(ctx.get("departments") or None),
-            micro_mode=opts.get("micro_mode"),
-            debug=bool(opts.get("debug") or False),
-            rerank=bool(opts.get("rerank") or False),
-            rerank_model=opts.get("rerank_model") or "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            rerank_candidates=int(opts.get("rerank_candidates") or 30),
-            stitch_by_path=False,  # 섹션 확장 방식 사용
-        )
-        state["retrieved"] = hits
-        return state
-    except Exception as e:
-        state["error"] = f"retrieval_error: {e}"
-        state["retrieved"] = []
-        return state
-
-
-def node_build_context(state: Dict[str, Any]) -> Dict[str, Any]:
-    if state.get("error") or state.get("skip_rag"):
-        state["context"] = ""
-        return state
-    hits = state.get("retrieved") or []
-    opts = state["opts"]
-    budget = int(opts.get("assemble_budget_chars") or 60000)  # 기본값 줄임
-    max_items = int(opts.get("max_ctx_chunks") or 8)
-    state["context"] = _build_context_from_hits(hits, max_items=max_items, budget_chars=budget)
-    state["must_include"] = []
-    return state
-
-
-# ==================== 후처리(질문 에코 제거/출처 병합) ====================
-
-_QUOTED_LINE_RE = re.compile(r'^\s*[\"“”].*[\"“”]\s*$')
-_SRC_SPLIT_RE = re.compile(r"\n\s*출처\s*:\s*\n", re.I)
-
-def _strip_redundant_lead(text: str) -> str:
-    """맨 앞 따옴표 에코/“~에 대해 질문…” 같은 리드 제거."""
-    if not text:
-        return text
-    lines = text.splitlines()
-    if not lines:
-        return text
-    first = lines[0].strip()
-    if _QUOTED_LINE_RE.match(first) or first.endswith("에 대해 질문해 주셨군요!"):
-        return "\n".join(lines[1:]).strip()
-    return text
-
-def _merge_sources(text: str) -> str:
-    """출처 섹션이 여러 번이면 하나로 병합."""
-    if not text:
-        return text
-    parts = _SRC_SPLIT_RE.split(text)
-    if len(parts) <= 2:
-        return text
-    body = parts[0].rstrip()
-    tails = [p.strip() for p in parts[1:] if p.strip()]
-    merged = []
-    for t in tails:
-        for ln in t.splitlines():
-            ln = ln.strip()
-            if ln and ln not in merged:
-                merged.append(ln)
-    return f"{body}\n\n출처:\n" + "\n".join(merged)
-
-
-# ==================== 답변 생성 ====================
-
-def _check_response_completeness(text: str) -> bool:
-    """응답의 완성도를 체크"""
-    text = (text or "").strip()
-    if not text:
-        return False
-    korean_endings = ('.', '요.', '다.', '니다.', '습니다.', '세요.', '어요.', '아요.', '지요.')
-    if '출처:' in text or '출처\n' in text:
-        return True
-    return text.endswith(korean_endings)
-
-def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
-    if state.get("skip_rag") or state.get("needs_clarification") or state.get("error"):
-        return state
-
-    hits = state.get("retrieved") or []
+def node_classify(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    q = state["question"]; hcat = _heuristic(q); chosen = hcat
+    confidence = 1.0 if hcat != "other" else 0.0
     use_llm = bool(state["opts"].get("use_llm", True))
-    intro = _pick_intro(state.get("question", ""), state)
-
-    # LLM 비사용 또는 히트 없음 → 요약+출처(인사말 포함)
-    if not use_llm or not hits:
-        src = _summarize_sources(hits)
-        state["answer"] = f"{intro}\n\n검색된 문서 요약을 제공합니다.\n\n출처:\n{src}"
-        state["llm_answer"] = None
-        return state
-
-    micro_mode = state["opts"].get("micro_mode", "exclude")
-    style_guide = state.get("style_guide") or ""
-    category = state.get("category") or "other"
-    rule = {
-        "exclude": "1) '마이크로전공' 내용은 제외하고 본전공 중심으로 답하세요.",
-        "only": "1) 마이크로전공만 대상으로 답하세요.",
-        "include": "1) 본전공과 마이크로 모두 포함하되, 본전공을 우선하세요.",
-    }.get(micro_mode, "1) 본전공을 우선하되 필요 시 마이크로도 포함하세요.")
-
-    persona = (
-        "아주대학교 학사안내 도우미다. 존댓말로 간결하게 답한다. "
-        "금지: 인사말을 생성하지 말 것, 질문 문장을 따옴표로 재진술하지 말 것, 불필요한 서론/결론 금지."
-    )
-    sys = (f"{persona}\n"
-           f"CONTEXT 근거로만 답하세요. 근거 없으면 '문서에서 확인되지 않습니다'라고 명시.\n"
-           f"{rule}\n"
-           f"가이드({category}): {style_guide}\n"
-           "반드시 본문 다음에 '출처:' 섹션을 하나만 넣으세요(중복 금지).")
-
-    # 컨텍스트 길이 제한
-    context = state['context']
-    if len(context) > 50000:
-        context = context[:45000] + "\n...(내용이 길어 일부 생략)..."
-
-    # ⛔ 인사말은 user 프롬프트에 넣지 않는다(모델이 인사말을 학습하지 않도록)
-    usr = (
-        f"질문: {state['question']}\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        "요구사항:\n"
-        "- 인사말 없이 본문만 작성\n"
-        "- 불릿/숫자 목록은 간결하게\n"
-        "- 마지막에 '출처:' 섹션 1개"
-    )
-
-    base_max_tokens = int(state["opts"].get("max_tokens") or 1500)
-    if category == "term_plan":
-        base_max_tokens = min(2500, base_max_tokens * 2)
-
-    llm = _make_llm(
-        model_name=state["opts"].get("model_name", config.LLM_MODEL),
-        temperature=float(state["opts"].get("temperature") or config.TEMPERATURE),
-        max_tokens=base_max_tokens,
-    )
-
-    try:
-        out = llm.invoke([{"role": "system", "content": sys},
-                          {"role": "user", "content": usr}])
-        body = (out.content or "").strip()
-
-        # 사후 정리
-        body = _strip_redundant_lead(body)  # 질문 에코/따옴표 제거
-        body = _merge_sources(body)         # 출처 섹션 병합
-
-        # 최종 조합: 인사말(앱) + 본문(모델)
-        final_txt = f"{intro}\n\n{body}".strip()
-
-        # 안전장치: 출처 없으면 붙이기
-        if "출처:" not in final_txt:
-            final_txt += "\n\n출처:\n" + _summarize_sources(hits)
-
-        # 완성도 보정
-        if not _check_response_completeness(final_txt):
-            if not final_txt.endswith(("...", "…")):
-                final_txt += "..."
-            final_txt += "\n\n[응답이 일부 생략되었을 수 있습니다]"
-
-        state["llm_answer"] = final_txt
-        state["answer"] = final_txt
-        return state
-
-    except Exception as e:
-        state["error"] = f"llm_error: {e}"
-        state["answer"] = f"{intro}\n\n모델 호출에 실패했습니다.\n\n출처:\n" + _summarize_sources(hits)
-        state["llm_answer"] = None
-        return state
+    need_llm = (hcat == "other") or bool(state["opts"].get("force_llm_route", False))
+    if use_llm and need_llm:
+        try:
+            llm = ChatOpenAI(model=state["opts"].get("model_name", config.LLM_MODEL), temperature=0)
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", ROUTER_SYSTEM),
+                ("user", "질문: {q}\nJSON만 출력: {\"primary\": \"...\", \"secondary\": [\"...\"], \"confidence\": 0.0~1.0}"),
+            ])
+            out = llm.with_structured_output(RouteSchema).invoke(prompt.format_messages(q=q))
+            if out and out.primary:
+                chosen = out.primary; confidence = float(out.confidence or 0.0)
+                if confidence < 0.55 and hcat != "other": chosen = hcat
+        except Exception:
+            pass
+    state["category"] = chosen
+    state["style_guide"] = STYLE_GUIDES.get(chosen, STYLE_GUIDES["other"])
+    _apply_category_overrides(state, chosen)
+    if chosen in ("practice_capstone", "track_rules", "rule_info"):
+        state["answer"] = _fixed_answer(chosen); state["skip_rag"] = True
+    else:
+        state["skip_rag"] = False
+    return state

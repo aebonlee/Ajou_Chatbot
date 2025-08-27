@@ -18,9 +18,8 @@ from app.services.retriever import retrieve
 from app.services.textutil import term_sort_key
 
 
-# -------------------- 인사말 템플릿 & 토픽 추출 --------------------
+# ==================== 인사말 템플릿 & 토픽 추출 ====================
 
-# {topic} 자리표시자를 사용하는 짧고 자연스러운 템플릿들
 INTRO_TEMPLATES_WITH_TOPIC = [
     "{topic} 관련 핵심만 정리해 드릴게요.",
     "{topic} 질문 주셔서 감사합니다. 요점만 안내드릴게요.",
@@ -30,7 +29,6 @@ INTRO_TEMPLATES_WITH_TOPIC = [
     "{topic} 중심으로 필요한 것만 깔끔히 정리했습니다.",
 ]
 
-# 토픽을 뽑지 못했을 때 사용할 기본 템플릿
 INTRO_TEMPLATES_GENERIC = [
     "좋은 질문이에요! 아래에 핵심만 정리해 드릴게요.",
     "문의 감사합니다. 요점만 빠르게 정리해 드립니다.",
@@ -93,7 +91,6 @@ def _extract_topic(question: str, state: Dict[str, Any]) -> str:
 
     # 4) 주요 키워드 스캔
     hits = [kw for kw in _KEYWORDS if kw in q]
-    # 대표 키워드 1~2개
     key_part = " · ".join(hits[:2]) if hits else ""
 
     # 조립 규칙
@@ -102,11 +99,9 @@ def _extract_topic(question: str, state: Dict[str, Any]) -> str:
         topic = " | ".join(parts) if (len(parts) >= 2) else parts[0]
         return _trim_topic(topic)
 
-    # 마지막으로, 질문 전체에서 긴 수식어 제거한 핵심명사 후보
-    # 불필요한 조사/마침표/따옴표 제거
+    # 마지막 폴백(질문 축약)
     fallback = re.sub(r"[\"'“”‘’]", "", q)
     fallback = re.sub(r"(에 대해|만|으로|는|은|이|가|을|를|요)$", "", fallback)
-    # 너무 길면 자름
     return _trim_topic(fallback) if fallback else ""
 
 def _pick_intro(question: str, state: Dict[str, Any]) -> str:
@@ -117,7 +112,7 @@ def _pick_intro(question: str, state: Dict[str, Any]) -> str:
     return random.choice(INTRO_TEMPLATES_GENERIC)
 
 
-# -------------------- 기존 유틸 --------------------
+# ==================== 공용 유틸 ====================
 
 def _safe_path(h: Dict[str, Any]) -> str:
     return (h.get("path")
@@ -180,7 +175,7 @@ def _make_llm(model_name: str, temperature: float, max_tokens: int):
         return ChatOpenAI(model=model_name, temperature=temperature, max_tokens=max_tokens)
 
 
-# -------------------- 그래프 노드 --------------------
+# ==================== 그래프 노드 ====================
 
 def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
     q = state["question"]
@@ -247,6 +242,7 @@ def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
         state["context_struct"] = {"faculties": [], "departments": hints_depts, "year": None, "need_slots": []}
         return state
 
+
 def node_need_more(state: Dict[str, Any]) -> Dict[str, Any]:
     if not bool(state["opts"].get("use_llm", True)):
         state["needs_clarification"] = False
@@ -258,6 +254,7 @@ def node_need_more(state: Dict[str, Any]) -> Dict[str, Any]:
     else:
         state["needs_clarification"] = False
     return state
+
 
 def node_retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
     if state.get("needs_clarification") or state.get("error") or state.get("skip_rag"):
@@ -287,6 +284,7 @@ def node_retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
         state["retrieved"] = []
         return state
 
+
 def node_build_context(state: Dict[str, Any]) -> Dict[str, Any]:
     if state.get("error") or state.get("skip_rag"):
         state["context"] = ""
@@ -299,17 +297,52 @@ def node_build_context(state: Dict[str, Any]) -> Dict[str, Any]:
     state["must_include"] = []
     return state
 
+
+# ==================== 후처리(질문 에코 제거/출처 병합) ====================
+
+_QUOTED_LINE_RE = re.compile(r'^\s*[\"“”].*[\"“”]\s*$')
+_SRC_SPLIT_RE = re.compile(r"\n\s*출처\s*:\s*\n", re.I)
+
+def _strip_redundant_lead(text: str) -> str:
+    """맨 앞 따옴표 에코/“~에 대해 질문…” 같은 리드 제거."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    if not lines:
+        return text
+    first = lines[0].strip()
+    if _QUOTED_LINE_RE.match(first) or first.endswith("에 대해 질문해 주셨군요!"):
+        return "\n".join(lines[1:]).strip()
+    return text
+
+def _merge_sources(text: str) -> str:
+    """출처 섹션이 여러 번이면 하나로 병합."""
+    if not text:
+        return text
+    parts = _SRC_SPLIT_RE.split(text)
+    if len(parts) <= 2:
+        return text
+    body = parts[0].rstrip()
+    tails = [p.strip() for p in parts[1:] if p.strip()]
+    merged = []
+    for t in tails:
+        for ln in t.splitlines():
+            ln = ln.strip()
+            if ln and ln not in merged:
+                merged.append(ln)
+    return f"{body}\n\n출처:\n" + "\n".join(merged)
+
+
+# ==================== 답변 생성 ====================
+
 def _check_response_completeness(text: str) -> bool:
     """응답의 완성도를 체크"""
     text = (text or "").strip()
     if not text:
         return False
-    # 한국어 문장 끝 패턴
     korean_endings = ('.', '요.', '다.', '니다.', '습니다.', '세요.', '어요.', '아요.', '지요.')
-    # 출처 섹션이 있는 경우
     if '출처:' in text or '출처\n' in text:
         return True
-    # 정상적인 문장 끝인 경우
     return text.endswith(korean_endings)
 
 def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -336,26 +369,34 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
         "include": "1) 본전공과 마이크로 모두 포함하되, 본전공을 우선하세요.",
     }.get(micro_mode, "1) 본전공을 우선하되 필요 시 마이크로도 포함하세요.")
 
-    # 간소화된 프롬프트
-    persona = "아주대학교 학사안내 도우미로서 존댓말로 간결하게 답변하세요."
+    persona = (
+        "아주대학교 학사안내 도우미다. 존댓말로 간결하게 답한다. "
+        "금지: 인사말을 생성하지 말 것, 질문 문장을 따옴표로 재진술하지 말 것, 불필요한 서론/결론 금지."
+    )
     sys = (f"{persona}\n"
-           f"CONTEXT 근거로만 답하세요. 근거 없으면 '문서에서 확인되지 않습니다' 표기.\n"
+           f"CONTEXT 근거로만 답하세요. 근거 없으면 '문서에서 확인되지 않습니다'라고 명시.\n"
            f"{rule}\n"
            f"가이드({category}): {style_guide}\n"
-           "답변 후 반드시 '출처:' 섹션 추가.")
+           "반드시 본문 다음에 '출처:' 섹션을 하나만 넣으세요(중복 금지).")
 
-    # 컨텍스트 길이 체크 및 조정
+    # 컨텍스트 길이 제한
     context = state['context']
-    if len(context) > 50000:  # 너무 길면 줄임
+    if len(context) > 50000:
         context = context[:45000] + "\n...(내용이 길어 일부 생략)..."
 
-    # 인사말을 사용자 메시지 프롬프트에 포함 (LLM이 본문 앞에 두도록 유도)
-    usr = f"{intro}\n\n질문: {state['question']}\n\nCONTEXT:\n{context}"
+    # ⛔ 인사말은 user 프롬프트에 넣지 않는다(모델이 인사말을 학습하지 않도록)
+    usr = (
+        f"질문: {state['question']}\n\n"
+        f"CONTEXT:\n{context}\n\n"
+        "요구사항:\n"
+        "- 인사말 없이 본문만 작성\n"
+        "- 불릿/숫자 목록은 간결하게\n"
+        "- 마지막에 '출처:' 섹션 1개"
+    )
 
-    # max_tokens 동적 조정
-    base_max_tokens = int(state["opts"].get("max_tokens") or 1500)  # 기본값 증가
+    base_max_tokens = int(state["opts"].get("max_tokens") or 1500)
     if category == "term_plan":
-        base_max_tokens = min(2500, base_max_tokens * 2)  # 학기별 계획은 더 긴 답변 필요
+        base_max_tokens = min(2500, base_max_tokens * 2)
 
     llm = _make_llm(
         model_name=state["opts"].get("model_name", config.LLM_MODEL),
@@ -366,21 +407,27 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         out = llm.invoke([{"role": "system", "content": sys},
                           {"role": "user", "content": usr}])
-        txt = (out.content or "").strip()
+        body = (out.content or "").strip()
 
-        # 응답 완성도 체크
-        if not _check_response_completeness(txt):
-            if not txt.endswith(("...", "…")):
-                txt += "..."
-            txt += "\n\n[응답이 일부 생략되었을 수 있습니다]"
+        # 사후 정리
+        body = _strip_redundant_lead(body)  # 질문 에코/따옴표 제거
+        body = _merge_sources(body)         # 출처 섹션 병합
 
-        # 출처 추가(없다면)
-        if "출처" not in txt and "SOURCE" not in txt:
-            txt += "\n\n출처:\n" + _summarize_sources(hits)
+        # 최종 조합: 인사말(앱) + 본문(모델)
+        final_txt = f"{intro}\n\n{body}".strip()
 
-        # 최종 세팅
-        state["llm_answer"] = txt
-        state["answer"] = txt
+        # 안전장치: 출처 없으면 붙이기
+        if "출처:" not in final_txt:
+            final_txt += "\n\n출처:\n" + _summarize_sources(hits)
+
+        # 완성도 보정
+        if not _check_response_completeness(final_txt):
+            if not final_txt.endswith(("...", "…")):
+                final_txt += "..."
+            final_txt += "\n\n[응답이 일부 생략되었을 수 있습니다]"
+
+        state["llm_answer"] = final_txt
+        state["answer"] = final_txt
         return state
 
     except Exception as e:
