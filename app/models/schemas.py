@@ -43,3 +43,9 @@ class RouteSchema(BaseModel):
     primary: Category
     secondary: List[Category] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
+    
+class NoticeQuery(BaseModel):
+    question: str
+
+class NoticeResponse(BaseModel):
+    answer: str

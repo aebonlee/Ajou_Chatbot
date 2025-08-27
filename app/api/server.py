@@ -21,8 +21,8 @@ from typing import List, Optional
 import uuid, time
 
 from app.core import config
-from app.models.schemas import QueryRequest           # /yoram 입력 스키마
-from app.graphs.pipeline import run_rag_graph         # LangGraph 진입점
+from app.models.schemas import QueryRequest,NoticeQuery,NoticeResponse          # /yoram 입력 스키마
+from app.graphs.pipeline import run_rag_graph,rag_chain        # LangGraph 진입점
 from app.utils.log import jlog                        # 선택적 구조화 로그
 
 # -----------------------------------------------------------------------------
@@ -300,86 +300,24 @@ async def post_info(req: InfoRequest, request: Request):
 
 
 # -----------------------------------------------------------------------------
-# 보조 엔드포인트: /announcement (공지)
+# 보조 엔드포인트: /notice (공지)
 # -----------------------------------------------------------------------------
-@app.post("/announcement")
-async def post_announcement(req: AnnouncementRequest, request: Request):
-    """
-    학과/단과대 **공지** 질의.
-    - 최소 1개 이상의 departments가 필요.
-    - 현재는 동일 컬렉션을 사용하지만, 실제 공지 크롤링/색인 시 별도 컬렉션 권장.
-    """
-    rid = str(uuid.uuid4())
 
-    if not req.departments:
-        return {
-            "question": req.question,
-            "answer": "어느 학과(또는 단과대) 공지인지 최소 1개를 선택해 주세요.",
-            "llm_answer": None,
-            "context": "",
-            "sources": [],
-            "micro_mode": "exclude",
-            "error": "bad_request: no_departments",
-            "clarification": None,
-        }
 
+@app.post("/notice", response_model=NoticeResponse)
+async def get_notice_answer(query: NoticeQuery):
+    """
+    사용자의 질문에 대한 공지사항을 검색하고 답변합니다.
+    """
     try:
-        try:
-            jlog(event="request", route="/announcement", request_id=rid,
-                 question=req.question, depts=req.departments)
-        except Exception:
-            pass
-
-        out = run_rag_graph(
-            question=req.question,
-            persist_dir=config.PERSIST_DIR,
-            collection=config.COLLECTION,            # 공지 컬렉션 분리 가능
-            embedding_model=config.EMBEDDING_MODEL,
-            topk=req.topk,
-            model_name=config.LLM_MODEL,
-            temperature=config.TEMPERATURE,
-            max_tokens=config.MAX_TOKENS,
-            use_llm=req.use_llm,
-            debug=req.debug,
-            scope_depts=req.departments,
-            micro_mode=req.micro_mode,
-            assemble_budget_chars=req.assemble_budget_chars,
-            max_ctx_chunks=req.max_ctx_chunks,
-            rerank=req.rerank or False,
-            rerank_model=req.rerank_model or "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            rerank_candidates=req.rerank_candidates or 30,
-        )
-
-        try:
-            jlog(event="result", route="/announcement", request_id=rid,
-                 error=out.get("error"), sources=len(out.get("sources") or []))
-        except Exception:
-            pass
-
-        return {
-            "question": out.get("question") or req.question,
-            "answer": out.get("answer"),
-            "llm_answer": out.get("llm_answer"),
-            "context": out.get("context"),
-            "sources": out.get("sources") or [],
-            "micro_mode": out.get("micro_mode", "exclude"),
-            "error": out.get("error"),
-            "clarification": out.get("clarification_prompt"),
-        }
-
+        # 2. rag_chain 호출
+        answer = rag_chain.invoke({"question": query.question})
+        return NoticeResponse(answer=answer)
     except Exception as e:
-        return {
-            "question": req.question,
-            "answer": "요청 처리 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요.",
-            "llm_answer": None,
-            "context": "",
-            "sources": [],
-            "micro_mode": "exclude",
-            "error": f"server_error: {e}",
-            "clarification": None,
-        }
-
-
+        # 오류 처리
+        return {"answer": f"오류가 발생했습니다: {str(e)}"}
+    
+    
 # -----------------------------------------------------------------------------
 # 임시 엔드포인트: /menu (식단)
 # -----------------------------------------------------------------------------

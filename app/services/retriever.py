@@ -11,9 +11,12 @@ import math
 import numpy as np
 from collections import defaultdict
 from rank_bm25 import BM25Okapi
-
+from langchain_community.vectorstores import Chroma
 from .storage import get_client, get_collection, get_all, get_where_all
 from .textutil import tokenize_ko, normalize_numbers, detect_year_semester_in_query
+from app.core.config import EMBEDDING_MODEL,PERSIST_DIR_NOTICE
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from datetime import datetime, timedelta
 
 EPS = 1e-9
 
@@ -388,3 +391,91 @@ def retrieve(
         paths = [h.get("path") for h in hits[:min(5, len(hits))]]
         print(f"[Retriever] expanded sections: {paths}")
     return hits
+
+#--------------------------------------------
+# 공지사항
+# -------------------------------------------
+
+# 임베딩 모델 로드
+model_name = EMBEDDING_MODEL  # Use the variable from config.py
+model_kwargs = {"device": "cpu"}
+encode_kwargs = {"normalize_embeddings": True}
+embeddings = HuggingFaceBgeEmbeddings(
+    model_name=model_name,
+    model_kwargs=model_kwargs,
+    encode_kwargs=encode_kwargs
+)
+#  질의(Query) 기간 및 메타데이터 필터 로직
+def get_time_filter(query: str):
+    query = query.lower()
+    match = re.search(r"(\d+)\s*(주|달|개월|년)", query)
+    if match:
+        number = int(match.group(1))
+        unit = match.group(2)
+        if "주" in unit:
+            past_date = datetime.now() - timedelta(weeks=number)
+        elif "달" in unit or "개월" in unit:
+            past_date = datetime.now() - timedelta(days=number * 30)
+        elif "년" in unit:
+            past_date = datetime.now() - timedelta(days=number * 365)
+        else:
+            past_date = datetime.now() - timedelta(weeks=2)
+        return {"date": {"$gte": int(past_date.timestamp())}}
+    two_week_ago = datetime.now() - timedelta(weeks=2)
+    return {"date": {"$gte": int(two_week_ago.timestamp())}}
+
+metadata_mapping = {
+    "공과대학": {"college_name": "공과대학", "aliases": ["공대"]},
+    "소프트웨어융합대학": {"college_name": "소프트웨어융합대학", "aliases": ["소융대"]},
+    "첨단신소재공학과": {"department_name": "첨단신소재공학과", "aliases": ["첨신공"]},
+    "건설시스템공학과": {"department_name": "건설시스템공학과", "aliases": ["건시공"]},
+    "교통시스템공학과": {"department_name": "교통시스템공학과", "aliases": ["교시공"]},
+    "소프트웨어학과": {"department_name": "소프트웨어학과", "aliases": ["소프트웨어과","소웨"]},
+    "환경안전공학과": {"department_name": "환경안전공학과", "aliases": []},
+    "응용화학생명공학과": {"department_name": "응용화학생명공학과", "aliases": ["응화생"]},
+    "응용화학공학과": {"department_name": "응용화학공학과", "aliases": ["화공과","화공"]},
+    "기계공학과": {"department_name": "기계공학과", "aliases": ["기계과"]},
+    "건축학과": {"department_name": "건축학과", "aliases": []},
+    "산업공학과": {"department_name": "산업공학과", "aliases": ["산공"]},
+    "융합시스템공학과": {"department_name": "융합시스템공학과", "aliases": ["융시공"]},
+    "국방디지털융합학과": {"department_name": "국방디지털융합학과", "aliases": ["국디융"]},
+    "디지털미디어학과": {"department_name": "디지털미디어학과", "aliases": ["디미과"]},
+    "사이버보안학과": {"department_name": "사이버보안학과", "aliases": []},
+    "인공지능융합학과": {"department_name": "인공지능융합학과", "aliases": ["인공지능과", "인공지능학과"]},
+    "일반공지": {"category": "일반공지", "aliases": ["일공"]},
+    "장학공지": {"category": "장학공지", "aliases": ["장학"]}
+}
+
+def get_enhanced_filter(query: str):
+    filters = []
+    query_lower = query.lower()
+    date_filter = get_time_filter(query)
+    filters.append(date_filter)
+
+    for official_name, meta_data in metadata_mapping.items():
+        search_terms = [official_name] + meta_data.get("aliases", [])
+        for term in search_terms:
+            if re.search(term, query_lower):
+                if "college_name" in meta_data:
+                    filters.append({"college_name": meta_data["college_name"]})
+                elif "department_name" in meta_data:
+                    filters.append({"department_name": meta_data["department_name"]})
+                elif "category" in meta_data:
+                    filters.append({"category": meta_data["category"]})
+                break
+    
+    return {"$and": filters}
+
+# 리트리버 생성 함수 
+def dynamic_retriever(query: str, filter_dict: dict):
+    loaded_vectorstore = Chroma(
+        persist_directory=PERSIST_DIR_NOTICE,
+        embedding_function=embeddings
+    )
+    # k=5로 설정하여 최종 답변에 사용할 5개 문서를 바로 가져옵니다.
+    return loaded_vectorstore.as_retriever(
+        search_kwargs={"filter": filter_dict, "k": 5}
+    ).get_relevant_documents(query)
+
+
+

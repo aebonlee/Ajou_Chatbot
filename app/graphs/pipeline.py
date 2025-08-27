@@ -4,6 +4,12 @@ from .state import GraphState
 from .nodes import node_parse_intent, node_need_more, node_retrieve, node_build_context, node_answer
 from .nodes_classify import node_classify
 from app.core import config
+from langchain_core.prompts import ChatPromptTemplate
+from app.services.retriever import get_enhanced_filter, dynamic_retriever
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.runnables import RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+from app.core.config import LLM_MODEL_NOTICE
 
 def build_graph() -> Any:
     g = StateGraph(GraphState)
@@ -103,3 +109,63 @@ def run_rag_graph(
         "clarification_prompt": out.get("clarification_prompt"),
         "llm_answer": out.get("llm_answer"),
     }
+
+
+
+
+
+################공지사항#####################
+    
+# -------------------------------
+# 프롬프트 템플릿 정의
+# -------------------------------
+template = """
+당신은 대학 공지사항을 정확하게 검색하여 제공하는 친절한 AI 비서입니다.
+아래에 제공된 "문서" 내용을 바탕으로 사용자의 "질문"에 답변하세요.
+
+**답변 형식:**
+- 답변은 찾은 공지사항 리스트를 아래 형식에 맞춰서 제공해야 합니다.
+- 만약 여러 개의 공지사항이 있다면, 모두 이 형식으로 리스트업해주세요.
+- 각 공지사항은 다음 형식을 따라야 합니다:
+[제목]: [공지사항의 제목]
+[URL]: [공지사항의 URL]
+
+**특별 지시:**
+1. 만약 제공된 "문서"에 사용자의 질문과 관련된 내용이 전혀 없다면, "죄송합니다. 제공된 문서에는 해당 정보가 없습니다."라고 답하세요.
+2. 사용자가 특정 학과나 단과대학, 또는 공지 유형(예: 장학)을 언급했지만, 관련 문서가 검색되지 않았을 경우, 사용자에게 해당 정보를 다시 명확하게 물어보세요.
+   - 예시 질문: "어떤 학과의 공지사항을 찾으시나요?" 또는 "어떤 종류의 공지를 찾으시나요?"
+
+---
+문서:
+{context}
+
+---
+질문: {question}
+
+답변:
+"""
+prompt = ChatPromptTemplate.from_template(template)
+
+# 입력 전처리 (question + filter 동시 생성)
+# -------------------------------
+def enrich_inputs(x):
+    return {
+        "question": x["question"],
+        "filter": get_enhanced_filter(x["question"])
+    }
+
+
+#  RAG 체인 구축
+llm = ChatGoogleGenerativeAI(model=LLM_MODEL_NOTICE)
+
+rag_chain = (
+    RunnableLambda(enrich_inputs)
+    | {
+        "context": RunnableLambda(lambda d: dynamic_retriever(d["question"], d["filter"])),
+        "question": RunnableLambda(lambda d: d["question"]),
+      }
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+

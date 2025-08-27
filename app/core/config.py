@@ -9,6 +9,8 @@ load_dotenv()
 
 # Chroma 저장소 설정
 PERSIST_DIR = os.getenv("PERSIST_DIR", "storage/chroma-acad")
+PERSIST_DIR_NOTICE = os.getenv("PERSIST_DIR", "storage/chroma-notice")
+
 COLLECTION  = os.getenv("COLLECTION", "acad_docs_bge_m3_clean")
 
 # 임베딩모델 정의
@@ -19,6 +21,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL_NOTICE = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 
 # 최대 토큰수
