@@ -1,48 +1,23 @@
 """
-하이브리드 검색기:
-- BM25(한국어 강화 토크나이저) + Dense(Chroma: bge-m3)
-- micro_mode 감지/후필터
-- 후보 풀 크게 → Cross-Encoder 재랭크(bge-reranker) → (옵션) path 스티칭
-- 쿼리 보강: 마이크로전공/목록성 키워드 자동 추가
-- 안정 가드: 안전 정규화, 가중치 클램핑, 후보 하한, 빈 결과 핸들링
+하이브리드 검색 + 섹션 확장:
+- BM25 + Dense + (옵션) Cross-Encoder 재랭크
+- 후보 1~N개 path/section_id를 골라 **섹션 전체 청크**를 확장/정렬(order_key) → 스티칭
+- 질문에 학년/학기 감지 시, 메타 필터로 바로 해당 term 섹션 전체 확장
 """
 from typing import List, Dict, Any, Optional, Tuple
 import re
+import unicodedata
 import math
 import numpy as np
-from rank_bm25 import BM25Okapi
 from collections import defaultdict
-from .storage import get_client, get_collection, get_all
-from .textutil import tokenize_ko, normalize_numbers, path_of
-from app.core import config  # 전역 스위치 사용
+from rank_bm25 import BM25Okapi
+
+from .storage import get_client, get_collection, get_all, get_where_all
+from .textutil import tokenize_ko, normalize_numbers, detect_year_semester_in_query
 
 EPS = 1e-9
 
-# -----------------------------
-# 마이크로 모드 감지 / 쿼리 보강
-# -----------------------------
-def detect_micro_mode(q: str) -> str:
-    s = q.replace(" ", "")
-    if "마이크로전공제외" in s or "마이크로제외" in s:
-        return "exclude"
-    if "마이크로전공만" in s or "마이크로만" in s:
-        return "only"
-    if ("마이크로전공" in s) or ("마이크로포함" in s) or ("마이크로 포함" in s):
-        return "include"
-    return "exclude"
-
-def _augment_query(q: str) -> str:
-    s = q
-    low = q.lower()
-    if ("마이크로전공" in q) or ("마이크로 전공" in q) or ("micro" in low):
-        s += " 마이크로전공 목록 전공명"
-    if any(k in q for k in ["요건", "정리", "졸업", "교육과정"]):
-        s += " 졸업요건 교육과정"
-    return s
-
-# -----------------------------
-# 스코어 정규화 유틸 (안전판)
-# -----------------------------
+# ---------------- 스코어 정규화 ----------------
 def _normalize(scores: Dict[int, float]) -> Dict[int, float]:
     if not scores:
         return {}
@@ -55,9 +30,7 @@ def _normalize(scores: Dict[int, float]) -> Dict[int, float]:
         return {k: 1.0 for k in scores}
     return {k: (v - vmin) / span for k, v in scores.items()}
 
-# -----------------------------
-# 개별 검색기
-# -----------------------------
+# ---------------- 개별 검색기 ----------------
 def _bm25_rank(scope_idx: List[int], all_docs: List[str], query: str, topn: int) -> Dict[int, float]:
     if not scope_idx or topn <= 0:
         return {}
@@ -71,48 +44,31 @@ def _bm25_rank(scope_idx: List[int], all_docs: List[str], query: str, topn: int)
     return {gi: float(s) for gi, s in top_pairs}
 
 def _dense(col, all_ids: List[str], where: Optional[Dict[str, Any]], q: str, ndense: int) -> Dict[int, float]:
-    """
-    Chroma dense 검색 → cosine distance 기준(작을수록 유사).
-    - similarity = 1 - distance 로 변환 후 [0, 1]로 클램핑.
-    - ids는 include에 넣지 말 것(Chroma가 기본으로 반환함).
-    - all_ids → 인덱스 매핑 딕셔너리로 O(1) 매칭.
-    """
     if ndense <= 0:
         return {}
-
     try:
         res = col.query(
             query_texts=[q],
             n_results=int(ndense),
             where=where or None,
-            # ⚠️ 'ids'는 include 대상이 아님. 기본으로 항상 반환됨.
-            include=["distances", "metadatas"],   # documents는 굳이 안 받아도 됨
+            include=["distances", "metadatas"],
         )
-    except Exception as e:
-        # 필요하면 debug 로깅
-        # print(f"[dense] query error: {e}")
+    except Exception:
         return {}
-
-    # 안전 파싱
     ids_list = res.get("ids") or []
     dists_list = res.get("distances") or []
     if not ids_list or not dists_list:
         return {}
-
     ids = ids_list[0] if isinstance(ids_list[0], (list, tuple)) else ids_list
     dists = dists_list[0] if isinstance(dists_list[0], (list, tuple)) else dists_list
     if not ids or not dists:
         return {}
-
-    # O(1) 매칭을 위한 id→글로벌인덱스 맵
     id2gi = {cid: gi for gi, cid in enumerate(all_ids)}
-
     out: Dict[int, float] = {}
     for cid, d in zip(ids, dists):
         gi = id2gi.get(cid)
         if gi is None:
             continue
-        # 거리 → 유사도 변환
         try:
             sim = 1.0 - float(d)
         except Exception:
@@ -120,41 +76,19 @@ def _dense(col, all_ids: List[str], where: Optional[Dict[str, Any]], q: str, nde
         if not math.isfinite(sim):
             sim = 0.0
         sim = max(0.0, min(1.0, sim))
-        # 동일 gi가 여러 번 나오면 최대값 유지
         prev = out.get(gi, 0.0)
         if sim > prev:
             out[gi] = sim
-
     return out
 
-# -----------------------------
-# 메타 필터/부스팅
-# -----------------------------
-def _is_micro(meta: Dict[str, Any]) -> bool:
-    v = meta.get("is_micro")
-    if v in ("Y", "N"):
-        return v == "Y"
-    path = (meta.get("path") or "")
-    major = (meta.get("major") or "")
-    return ("마이크로전공" in path) or ("마이크로전공" in major)
-
-def _section_boost(meta: Dict[str, Any]) -> float:
-    sec = (meta.get("section") or "")
-    return 2.0 if ("졸업요건" in sec or "교육과정" in sec) else 0.0
-
-def _scope_boost(meta: Dict[str, Any], depts: Optional[List[str]]) -> float:
-    return 2.0 if (depts and meta.get("dept") in set(depts)) else 0.0
-
-# -----------------------------
-# 재랭크 (Cross-Encoder)
-# -----------------------------
+# ---------------- 재랭크 ----------------
 def _apply_cross_encoder_rerank(
     question: str,
     candidates: List[Tuple[int, float]],
     all_docs: List[str],
     all_metas: List[Dict[str, Any]],
     model_name: str,
-    debug: bool = False,
+    debug: bool = False
 ) -> List[Tuple[int, float]]:
     try:
         from sentence_transformers import CrossEncoder
@@ -162,10 +96,8 @@ def _apply_cross_encoder_rerank(
         if debug:
             print("[Retriever] sentence-transformers 미설치 → 재랭크 생략")
         return candidates
-
     if not candidates:
         return candidates
-
     ce = CrossEncoder(model_name)
     idxs = [gi for gi, _ in candidates]
     pairs = []
@@ -174,14 +106,12 @@ def _apply_cross_encoder_rerank(
         path = (meta.get("path") or "")
         text = (all_docs[gi] or "")
         pairs.append((question, f"{path}\n{text[:1500]}"))
-
     try:
         ce_scores = ce.predict(pairs)
     except Exception:
         if debug:
             print("[Retriever] CrossEncoder 예측 실패 → 재랭크 생략")
         return candidates
-
     first = {gi: sc for gi, sc in candidates}
     blended = [(gi, 0.7 * float(cs) + 0.3 * float(first.get(gi, 0.0))) for gi, cs in zip(idxs, ce_scores)]
     blended.sort(key=lambda x: x[1], reverse=True)
@@ -189,92 +119,152 @@ def _apply_cross_encoder_rerank(
         print(f"[Retriever] rerank applied with {model_name}, candidates={len(idxs)}")
     return blended
 
-# -----------------------------
-# 경로 기준 스티칭 (옵션)
-# -----------------------------
-def _stitch_by_path(
-    ordered_pairs: List[Tuple[int, float]],
+# ---------------- 스티칭/클린업 유틸 ----------------
+_ZW_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
+
+
+def _clean_unicode(s: str) -> str:
+    """제로폭/비정규 문자 제거, NFKC 정규화, 과도한 개행 압축."""
+    if not s:
+        return ""
+    import re
+    import unicodedata
+
+    # 제로폭 문자 제거
+    s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+    # NFKC 정규화
+    s = unicodedata.normalize("NFKC", s)
+    # 과도한 개행 압축 (3개 이상 → 2개)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    # 앞뒤 공백 제거
+    return s.strip()
+
+def _safe_join(parts: List[str]) -> str:
+    """오버랩 기반 절단 없이, 파트별 클린업 후 빈 줄 하나로 연결."""
+    clean = [_clean_unicode(p) for p in parts if (p or "").strip()]
+    return "\n\n".join(clean)
+
+# (참고) 필요 시 남겨두지만 현재는 사용하지 않음.
+def _smart_stitch_texts(parts: List[str], overlap_hint: int = 200) -> str:
+    if not parts:
+        return ""
+    out = parts[0] or ""
+    for p in parts[1:]:
+        a = out[-overlap_hint:]
+        b = (p or "")[:overlap_hint]
+        cut = 0
+        maxk = min(len(a), len(b))
+        for k in range(maxk, 0, -1):
+            if a[-k:] == b[:k]:
+                cut = k
+                break
+        out = out + (p[cut:] if cut else p)
+    return out
+
+
+def _expand_by_section(col, section_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    동일한 'section'(H2) 또는 동일한 'term'(H4 section_id)에 속한 모든 청크를
+    order_key 오름차순으로 모아서 하나로 합친다.
+    개선된 스티칭 알고리즘 사용.
+    """
+    is_term = (section_meta.get("section_id") or "").startswith("term_")
+    if is_term:
+        where: Dict[str, Any] = {"section_id": section_meta.get("section_id")}
+    else:
+        # 동일 파일·섹션 범위 필터
+        where = {
+            "$and": [
+                {"source_path": section_meta.get("source_path")},
+                {"section": section_meta.get("section")},
+                {"college": section_meta.get("college")},
+                {"dept": section_meta.get("dept")},
+            ]
+        }
+
+    ids, docs, metas = get_where_all(col, where)
+    metas_docs = list(zip(metas, docs))
+    metas_docs.sort(key=lambda md: (md[0].get("order_key") or "999.999.9999"))
+
+    parts = [d or "" for _, d in metas_docs]
+
+    # 개선된 스티칭 사용 - 오버랩된 청크들을 올바르게 연결
+    stitched = _smart_stitch_with_overlap_detection(parts, max_overlap=200)
+
+    rep_meta = metas_docs[0][0] if metas_docs else section_meta
+    rep_path = rep_meta.get("path") or section_meta.get("path") or ""
+    return {
+        "id": rep_meta.get("section_id") or rep_meta.get("source") or "",
+        "score": 1.0,
+        "document": stitched,
+        "metadata": rep_meta,
+        "path": rep_path,
+    }
+
+
+def _smart_stitch_with_overlap_detection(parts: List[str], max_overlap: int = 200) -> str:
+    """
+    오버랩 기반 스티칭 개선:
+    1. 연속된 청크 간 최대 max_overlap 길이까지 중복 검사
+    2. 중복 구간 발견 시 제거하여 연결
+    3. 중복이 없으면 단순 연결
+    """
+    if not parts:
+        return ""
+
+    if len(parts) == 1:
+        return _clean_unicode(parts[0] or "")
+
+    result = _clean_unicode(parts[0] or "")
+
+    for i in range(1, len(parts)):
+        current = _clean_unicode(parts[i] or "")
+        if not current:
+            continue
+
+        # 이전 결과의 끝부분과 현재 청크의 시작부분에서 중복 검사
+        overlap_found = False
+        max_check = min(max_overlap, len(result), len(current))
+
+        # 긴 중복부터 짧은 중복까지 확인
+        for overlap_len in range(max_check, 10, -1):  # 최소 10자 이상만 중복으로 간주
+            if result[-overlap_len:] == current[:overlap_len]:
+                # 중복 발견 - 중복 부분 제거하고 연결
+                result = result + current[overlap_len:]
+                overlap_found = True
+                break
+
+        if not overlap_found:
+            # 중복 없음 - 단순 연결 (개행으로 구분)
+            result = result + "\n\n" + current
+
+    return result
+
+def _top_candidates_with_expand(
+    question: str,
     *,
+    col,
     all_ids: List[str],
     all_docs: List[str],
     all_metas: List[Dict[str, Any]],
     topk: int,
+    lex_weight: float,
+    scope_idx: List[int],
+    where_dense: Optional[Dict[str, Any]],
+    rerank: bool,
+    rerank_model: str,
+    debug: bool
 ) -> List[Dict[str, Any]]:
-    by_path: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
-    for gi, sc in ordered_pairs:
-        raw_doc = all_docs[gi] or ""
-        meta = all_metas[gi] or {}
-        p = path_of(raw_doc) or meta.get("path", "") or ""
-        if not p:
-            p = f"__ID__:{all_ids[gi]}"
-        by_path[p].append((gi, sc))
-
-    groups_sorted = sorted(by_path.items(), key=lambda kv: max(s for _, s in kv[1]), reverse=True)
-
-    hits: List[Dict[str, Any]] = []
-    for path, items in groups_sorted:
-        items.sort(key=lambda x: x[1], reverse=True)
-        gi_rep, best_score = items[0]
-        bodies: List[str] = []
-        for gi, _ in items:
-            raw = all_docs[gi] or ""
-            if raw.startswith("[PATH]") and "\n" in raw:
-                raw = raw.split("\n", 1)[1]
-            bodies.append(raw.strip())
-        stitched_doc = f"[PATH] {path}\n" + "\n\n".join(bodies)
-
-        hits.append({
-            "id": all_ids[gi_rep],
-            "score": float(best_score),
-            "document": stitched_doc,
-            "metadata": all_metas[gi_rep],
-            "path": path,
-        })
-        if len(hits) >= topk:
-            break
-    return hits
-
-# -----------------------------
-# 스코프 1개 단위 검색
-# -----------------------------
-def _single_scope_retrieve(
-    question: str, *, persist_dir: str, collection: str, embedding_model: str,
-    topk: int, lex_weight: float, scope_colleges: Optional[List[str]],
-    scope_depts: Optional[List[str]], micro_mode: str, debug: bool,
-    rerank: bool = True, rerank_model: str = "BAAI/bge-reranker-v2-m3",
-    rerank_candidates: int = 40,
-    stitch_by_path: bool = False,
-) -> List[Dict[str, Any]]:
-    client = get_client(persist_dir)
-    col = get_collection(client, collection, embedding_model)
-    all_ids, all_docs, all_metas = get_all(col)
-
-    where = {"dept": {"$in": scope_depts}} if scope_depts else ({"college": {"$in": scope_colleges}} if scope_colleges else None)
-
-    q_aug = _augment_query(question)
-    qn = normalize_numbers(q_aug)
-
-    if scope_depts:
-        scope_idx = [i for i, m in enumerate(all_metas) if (m or {}).get("dept") in set(scope_depts)]
-    elif scope_colleges:
-        scope_idx = [i for i, m in enumerate(all_metas) if (m or {}).get("college") in set(scope_colleges)]
-    else:
-        scope_idx = list(range(len(all_docs)))
-
-    if not scope_idx:
-        return []
-
-    pool = max(int(rerank_candidates or 0), topk * 4, 60, 1)
+    pool = max(topk * 6, 80)  # 충분히 크게
+    qn = normalize_numbers(question)
 
     bm25_raw = _bm25_rank(scope_idx, all_docs, qn, topn=min(pool, len(scope_idx)))
     bm25 = _normalize(bm25_raw)
 
-    dense_raw = _dense(col, all_ids, where, qn, ndense=min(pool, len(all_ids)))
+    dense_raw = _dense(col, all_ids, where_dense, qn, ndense=min(pool, len(all_ids)))
     dense = _normalize(dense_raw)
 
     a = 0.85 if lex_weight is None else float(lex_weight)
-    if not math.isfinite(a):
-        a = 0.85
     a = max(0.0, min(1.0, a))
     b = 1.0 - a
 
@@ -292,78 +282,30 @@ def _single_scope_retrieve(
 
     for gi in pool_idx:
         base = a * bm25.get(gi, 0.0) + b * dense.get(gi, 0.0)
-        if not math.isfinite(base):
-            base = 0.0
         combined.append((gi, base))
     combined.sort(key=lambda x: x[1], reverse=True)
 
     if rerank and combined:
-        cand_n = max(int(rerank_candidates or 0), 1)
-        cand = combined[: min(cand_n, len(combined))]
-        reranked = _apply_cross_encoder_rerank(
-            question, cand, all_docs, all_metas, model_name=rerank_model, debug=debug
-        )
-        cand_set = {gi for gi, _ in cand}
-        others = [(gi, sc) for gi, sc in combined if gi not in cand_set]
-        combined = reranked + others
+        cand_n = min(max(40, topk * 8), len(combined))
+        cand = combined[:cand_n]
+        combined = _apply_cross_encoder_rerank(question, cand, all_docs, all_metas, rerank_model, debug=debug)
 
-    # micro 후필터
-    filtered: List[Tuple[int, float]] = []
-    for gi, sc in combined:
+    # 후보 상위에서 path/section_id 기준으로 섹션 확장
+    hits: List[Dict[str, Any]] = []
+    seen_sections = set()
+    for gi, _ in combined:
         meta = all_metas[gi] or {}
-        if micro_mode == "exclude" and _is_micro(meta):
+        key = meta.get("section_id") or meta.get("path")
+        if not key or key in seen_sections:
             continue
-        if micro_mode == "only" and not _is_micro(meta):
-            continue
-        filtered.append((gi, sc))
-
-    if not filtered:
-        return []
-
-    # 재가중 & 정렬
-    rescored: List[Tuple[int, float]] = []
-    for gi, sc in filtered:
-        meta = all_metas[gi] or {}
-        sc2 = sc + _scope_boost(meta, scope_depts) + _section_boost(meta)
-        if micro_mode == "only" and _is_micro(meta):
-            sc2 += 1.0
-        if micro_mode == "exclude" and _is_micro(meta):
-            sc2 -= 1.0
-        if not math.isfinite(sc2):
-            sc2 = 0.0
-        rescored.append((gi, sc2))
-    rescored.sort(key=lambda x: x[1], reverse=True)
-
-    # 스티칭 옵션(지금은 일단 사용안하는중)
-    if stitch_by_path:
-        hits = _stitch_by_path(
-            rescored,
-            all_ids=all_ids,
-            all_docs=all_docs,
-            all_metas=all_metas,
-            topk=topk,
-        )
-    else:
-        # 스티칭 없이 개별 청크 그대로 반환
-        hits = []
-        for gi, sc in rescored[:topk]:
-            meta = all_metas[gi] or {}
-            hits.append({
-                "id": all_ids[gi],
-                "score": float(sc),
-                "document": all_docs[gi],
-                "metadata": meta,
-                "path": meta.get("path", ""),
-            })
-
-    if debug:
-        paths = [h.get("path") for h in hits[:5]]
-        print(f"[Retriever] stitch={stitch_by_path}  hits={len(hits)}  top paths: {paths}")
+        seen_sections.add(key)
+        expanded = _expand_by_section(col, meta)
+        hits.append(expanded)
+        if len(hits) >= topk:
+            break
     return hits
 
-# -----------------------------
-# 복수 스코프 → 병합
-# -----------------------------
+# ---------------- 공개 API ----------------
 def retrieve(
     question: str,
     *,
@@ -374,56 +316,75 @@ def retrieve(
     lex_weight: float = 0.85,
     scope_colleges: Optional[List[str]] = None,
     scope_depts: Optional[List[str]] = None,
-    micro_mode: Optional[str] = None,
+    micro_mode: Optional[str] = None,   # 저장되어 있으면 후필터에 사용 가능(여기선 생략)
     debug: bool = False,
     rerank: bool = True,
     rerank_model: str = "BAAI/bge-reranker-v2-m3",
-    rerank_candidates: int = 40,
-    stitch_by_path: bool = False,
+    rerank_candidates: int = 40,        # 유지: 외부 옵션 호환
+    stitch_by_path: bool = False,       # 사용하지 않음(섹션 확장 방식으로 대체)
 ) -> List[Dict[str, Any]]:
-    mm = micro_mode or detect_micro_mode(question)
 
-    if scope_depts and len(scope_depts) > 1:
-        per: List[List[Dict[str, Any]]] = []
-        for d in scope_depts:
-            per.append(_single_scope_retrieve(
-                question,
-                persist_dir=persist_dir,
-                collection=collection,
-                embedding_model=embedding_model,
-                topk=topk,
-                lex_weight=lex_weight,
-                scope_colleges=None,
-                scope_depts=[d],
-                micro_mode=mm,
-                debug=debug,
-                rerank=rerank,
-                rerank_model=rerank_model,
-                rerank_candidates=rerank_candidates,
-                stitch_by_path=stitch_by_path,
-            ))
-        scores: Dict[str, float] = {}
-        by_id: Dict[str, Dict[str, Any]] = {}
-        for docs in per:
-            for rank, h in enumerate(docs):
-                hid = h["id"]; by_id[hid] = h
-                scores[hid] = scores.get(hid, 0.0) + 1.0 / (60 + rank + 1)
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
-        return [by_id[_id] for _id, _ in ranked]
+    client = get_client(persist_dir)
+    col = get_collection(client, collection, embedding_model)
+    all_ids, all_docs, all_metas = get_all(col)
 
-    return _single_scope_retrieve(
+    # 범위 스코프
+    if scope_depts:
+        scope_idx = [i for i, m in enumerate(all_metas) if (m or {}).get("dept") in set(scope_depts)]
+        where_dense = {"dept": {"$in": scope_depts}}
+    elif scope_colleges:
+        scope_idx = [i for i, m in enumerate(all_metas) if (m or {}).get("college") in set(scope_colleges)]
+        where_dense = {"college": {"$in": scope_colleges}}
+    else:
+        scope_idx = list(range(len(all_docs)))
+        where_dense = None
+
+    # 1) 질문에서 학년/학기 감지 → term 섹션 직행 확장 시도
+    y, s = detect_year_semester_in_query(question)
+    if (y or s) and scope_idx:
+        base_where: Dict[str, Any] = {}
+        if y: base_where["year"] = y
+        if s: base_where["semester"] = s
+        if scope_depts:
+            base_where["dept"] = {"$in": scope_depts}
+        elif scope_colleges:
+            base_where["college"] = {"$in": scope_colleges}
+
+        _ids_t, _docs_t, metas_t = get_where_all(col, base_where)
+        if metas_t:
+            # 동일 term(section_id: term_*) 단위로 그룹핑 → 섹션 확장
+            by_term: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for m in metas_t:
+                sid = m.get("section_id") or ""
+                if sid.startswith("term_"):
+                    by_term[sid].append(m)
+            hits: List[Dict[str, Any]] = []
+            for sid, group in by_term.items():
+                exp = _expand_by_section(col, group[0])
+                hits.append(exp)
+                if len(hits) >= topk:
+                    break
+            if hits:
+                if debug:
+                    print(f"[Retriever] direct term expand: {y} {s}, hits={len(hits)}")
+                return hits
+
+    # 2) 일반 하이브리드 검색 → 상위 후보 섹션 확장
+    hits = _top_candidates_with_expand(
         question,
-        persist_dir=persist_dir,
-        collection=collection,
-        embedding_model=embedding_model,
+        col=col,
+        all_ids=all_ids,
+        all_docs=all_docs,
+        all_metas=all_metas,
         topk=topk,
         lex_weight=lex_weight,
-        scope_colleges=scope_colleges,
-        scope_depts=scope_depts,
-        micro_mode=mm,
-        debug=debug,
+        scope_idx=scope_idx,
+        where_dense=where_dense,
         rerank=rerank,
         rerank_model=rerank_model,
-        rerank_candidates=rerank_candidates,
-        stitch_by_path=stitch_by_path,
+        debug=debug,
     )
+    if debug:
+        paths = [h.get("path") for h in hits[:min(5, len(hits))]]
+        print(f"[Retriever] expanded sections: {paths}")
+    return hits

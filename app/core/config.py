@@ -22,7 +22,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 
 # 최대 토큰수
-MAX_TOKENS  = int(os.getenv("MAX_TOKENS", "3072"))
+MAX_TOKENS  = int(os.getenv("MAX_TOKENS", "6144"))
 
 # 검색/결합 파라미터
 TOPK = int(os.getenv("TOPK", "8"))
