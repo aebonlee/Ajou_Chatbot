@@ -1,6 +1,0 @@
-HTTP/1.1 200 OK
-date: Wed, 27 Aug 2025 12:26:00 GMT
-server: uvicorn
-content-length: 1457
-content-type: application/json
-
