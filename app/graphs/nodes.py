@@ -1,7 +1,23 @@
-# app/graphs/nodes.py
-from typing import List, Dict, Any
-import json, re, random
+"""
+LangGraph에서 사용하는 '노드' 모음.
 
+그래프 단계 개요
+1) node_parse_intent   : 질문에서 단과대/학과/학년 등 구조화 정보 추출(LLM or 휴리스틱)
+2) node_need_more      : 학과/단과대 추출 실패 시 추가정보 요구 플래그 설정
+3) node_retrieve       : 벡터/용어 혼합 검색 → 후보 문서(hit) 목록 반환
+4) node_build_context  : hit 목록을 컨텍스트 텍스트로 구성(예산/조각 수 제한)
+5) node_classify       : 질문 카테고리 분류(간단 휴리스틱 + 옵션으로 LLM)
+6) node_answer         : 최종 답변 생성(인사말/본문/출처 병합 및 후처리)
+
+역할 분리 원칙
+- '인사말 생성', '출처 1회만 출력', '질문 에코 제거' 같은 UX 후처리는 여기서 책임진다.
+- 서버는 결과를 있는 그대로 전달만 한다.
+"""
+
+from typing import List, Dict, Any, Literal
+import json, re, random, os
+
+# LLM 클라이언트 (사용 가능한 것만 import)
 try:
     from langchain_openai import ChatOpenAI
 except Exception:
@@ -10,116 +26,95 @@ try:
     from langchain_anthropic import ChatAnthropic
 except Exception:
     ChatAnthropic = None
+
 from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
 from app.core import config
-from app.models.schemas import QuerySchema
-from app.services.retriever import retrieve
-from app.services.textutil import term_sort_key
+from app.models.schemas import QuerySchema         # LLM 구조화 출력 스키마
+from app.services.retriever import retrieve        # 검색기(벡터+용어)
+from app.services.textutil import term_sort_key    # 학기 정렬용 키 생성
 
-
-# ==================== 인사말 템플릿 & 토픽 추출 ====================
-
+# -----------------------------------------------------------------------------
+# 인사말/토픽 유틸
+# -----------------------------------------------------------------------------
 INTRO_TEMPLATES_WITH_TOPIC = [
     "{topic} 관련 핵심만 정리해 드릴게요.",
     "{topic} 질문 주셔서 감사합니다. 요점만 안내드릴게요.",
     "{topic}에 대해 물어보셨네요. 바로 정리해 드립니다.",
-    "좋은 질문이에요—{topic} 기준으로 안내드릴게요.",
     "{topic}: 아래에 한눈에 보이게 정리했어요.",
-    "{topic} 중심으로 필요한 것만 깔끔히 정리했습니다.",
 ]
-
 INTRO_TEMPLATES_GENERIC = [
     "좋은 질문이에요! 아래에 핵심만 정리해 드릴게요.",
     "문의 감사합니다. 요점만 빠르게 정리해 드립니다.",
-    "바로 핵심만 안내드릴게요.",
 ]
 
 _KOR_WS = re.compile(r"\s+")
 _DEPT_PAT = re.compile(r"([가-힣A-Za-z0-9]+학과)")
 _TERM_PAT = re.compile(r"([1-4])\s*학\s*년(?:\s*([1-2])\s*학\s*기)?")
-_KEYWORDS = [
-    "전공필수", "졸업요건", "졸업 이수학점", "이수학점", "권장 이수", "교육과정",
-    "과목", "선수과목", "BSM", "학기별", "로드맵", "전공기초", "영어강의",
-]
+_KEYWORDS = ["전공필수", "졸업요건", "이수학점", "권장 이수", "교육과정", "과목", "선수과목", "BSM", "학기별", "로드맵"]
 
 def _compact_spaces(s: str) -> str:
+    """연속 공백/개행을 1칸으로 압축."""
     return _KOR_WS.sub(" ", (s or "").strip())
 
 def _trim_topic(topic: str, max_len: int = 22) -> str:
+    """UI에 들어갈 짧은 토픽 문자열로 다듬기."""
     t = topic.strip(" \n\t-–—:·,.\"'“”‘’")
-    if len(t) <= max_len:
-        return t
-    return t[:max_len-1] + "…"
+    return t if len(t) <= max_len else (t[:max_len-1] + "…")
 
 def _extract_topic(question: str, state: Dict[str, Any]) -> str:
     """
-    질문에서 짧은 키워드 토픽을 뽑아낸다.
-    우선순위:
-      1) scope_depts/LLM 파싱 결과의 departments
-      2) 질문에서 'OO학과' 패턴
-      3) 학년/학기 & 주요 키워드 결합
-      4) 주요 키워드 단독
+    질문에서 UI용 '짧은 토픽'을 추출.
+    우선순위: (스코프 힌트) → ('OO학과' 패턴) → (학년/학기) → (핵심 키워드).
     """
     q = _compact_spaces(question or "")
 
-    # 1) 요청 힌트/파싱 결과로 들어온 학과
-    depts = []
-    try:
-        depts = list(state.get("context_struct", {}).get("departments") or []) \
-                or list(state.get("opts", {}).get("scope_depts") or [])
-    except Exception:
-        depts = []
+    # 스코프 힌트/파싱 결과에서 학과명 우선 사용
+    depts = list(state.get("context_struct", {}).get("departments") or []) \
+            or list(state.get("opts", {}).get("scope_depts") or [])
     dept_name = (depts[0] if depts else "")
 
-    # 2) 질문에서 'OO학과' 직접 추출
+    # 질문 문장 자체에서 'OO학과' 캡처
     if not dept_name:
-        m_dept = _DEPT_PAT.search(q)
-        if m_dept:
-            dept_name = m_dept.group(1)
+        m = _DEPT_PAT.search(q)
+        if m: dept_name = m.group(1)
 
-    # 3) 학년/학기 추출
+    # 학년/학기
     term_txt = ""
-    m_term = _TERM_PAT.search(q)
-    if m_term:
-        y = m_term.group(1)
-        s = m_term.group(2)
-        if y and s:
-            term_txt = f"{y}학년 {s}학기"
-        elif y:
-            term_txt = f"{y}학년"
+    m = _TERM_PAT.search(q)
+    if m:
+        y, s = m.group(1), m.group(2)
+        term_txt = f"{y}학년 {s}학기" if (y and s) else (f"{y}학년" if y else "")
 
-    # 4) 주요 키워드 스캔
+    # 주요 키워드(2개까지)
     hits = [kw for kw in _KEYWORDS if kw in q]
     key_part = " · ".join(hits[:2]) if hits else ""
 
-    # 조립 규칙
-    parts = [p for p in [dept_name, term_txt, key_part] if p]
+    parts = [p for p in (dept_name, term_txt, key_part) if p]
     if parts:
-        topic = " | ".join(parts) if (len(parts) >= 2) else parts[0]
-        return _trim_topic(topic)
+        return _trim_topic(" | ".join(parts) if len(parts) >= 2 else parts[0])
 
-    # 마지막 폴백(질문 축약)
+    # 폴백: 질문 축약
     fallback = re.sub(r"[\"'“”‘’]", "", q)
     fallback = re.sub(r"(에 대해|만|으로|는|은|이|가|을|를|요)$", "", fallback)
     return _trim_topic(fallback) if fallback else ""
 
 def _pick_intro(question: str, state: Dict[str, Any]) -> str:
-    topic = _extract_topic(question, state)
-    if topic:
-        tpl = random.choice(INTRO_TEMPLATES_WITH_TOPIC)
-        return tpl.format(topic=topic)
-    return random.choice(INTRO_TEMPLATES_GENERIC)
+    """토픽이 있으면 토픽형 인사, 없으면 일반 인사."""
+    t = _extract_topic(question, state)
+    return (random.choice(INTRO_TEMPLATES_WITH_TOPIC).format(topic=t)) if t else random.choice(INTRO_TEMPLATES_GENERIC)
 
 
-# ==================== 공용 유틸 ====================
-
+# -----------------------------------------------------------------------------
+# 공용 텍스트/컨텍스트 유틸
+# -----------------------------------------------------------------------------
 def _safe_path(h: Dict[str, Any]) -> str:
-    return (h.get("path")
-            or (h.get("metadata") or {}).get("path")
-            or "").strip()
+    """히트의 경로나 메타에 기재된 경로를 추출."""
+    return (h.get("path") or (h.get("metadata") or {}).get("path") or "").strip()
 
 def _dedup_lines(text: str) -> str:
+    """바로 위 줄과 동일한 내용은 제거(스크랩 중복 줄 방지)."""
     out, prev = [], None
     for ln in (text or "").splitlines():
         cur = ln.strip()
@@ -130,25 +125,38 @@ def _dedup_lines(text: str) -> str:
     return "\n".join(out)
 
 def _summarize_sources(hits: List[Dict[str, Any]], max_items: int = 8) -> str:
+    """
+    UI에 들어갈 '출처 요약' 문자열을 만든다.
+    - 파일 이름/제목 위주로 간결하게.
+    """
     if not hits:
         return "(없음)"
     lines = []
     for i, h in enumerate(hits[:max_items], 1):
-        lines.append(f"{i}. {_safe_path(h)}")
+        meta = h.get("metadata") or {}
+        title = (meta.get("title") or "").strip()
+        path = _safe_path(h)
+        name = title or (os.path.basename(path) or path)
+        name = name.replace("_", " ")
+        lines.append(f"{i}. {name}")
     return "\n".join(lines)
 
 def _build_context_from_hits(hits: List[Dict[str, Any]], *, max_items: int, budget_chars: int) -> str:
+    """
+    LLM에 투입할 컨텍스트 텍스트를 조립한다.
+    - 연/학기 메타가 있는 경우 우선 정렬
+    - 예산(budget_chars) 안에서 출처별 블록을 이어붙임
+    """
     if not hits:
         return ""
-    # 연/학기 우선 정렬(메타가 있으면)
     def _ord(h):
         m = h.get("metadata") or {}
         y, s = m.get("year"), m.get("semester")
         return (0, *term_sort_key(y, s)) if (y or s) else (1, 99, 99)
+
     hits = sorted(hits, key=_ord)
 
-    parts: List[str] = []
-    used = 0
+    parts, used = [], 0
     for i, h in enumerate(hits[:max_items], 1):
         path = _safe_path(h)
         body = _dedup_lines(h.get("document") or "")
@@ -156,7 +164,7 @@ def _build_context_from_hits(hits: List[Dict[str, Any]], *, max_items: int, budg
         blen = len(block)
         if used + blen > budget_chars:
             remain = budget_chars - used
-            if remain > 200:  # 최소한의 컨텍스트 보장
+            if remain > 200:  # 최소 블록 길이 보장
                 parts.append(block[:remain])
             break
         parts.append(block)
@@ -164,6 +172,7 @@ def _build_context_from_hits(hits: List[Dict[str, Any]], *, max_items: int, budg
     return "\n\n---\n\n".join(parts)
 
 def _make_llm(model_name: str, temperature: float, max_tokens: int):
+    """모델명으로 OpenAI/Anthropic 중 적절한 클라이언트를 생성."""
     provider = config.llm_provider_from_model(model_name)
     if provider == "anthropic":
         if ChatAnthropic is None:
@@ -175,13 +184,17 @@ def _make_llm(model_name: str, temperature: float, max_tokens: int):
         return ChatOpenAI(model=model_name, temperature=temperature, max_tokens=max_tokens)
 
 
-# ==================== 그래프 노드 ====================
-
+# -----------------------------------------------------------------------------
+# 노드: 의도 파싱 → 추가정보 필요 여부 → 검색 → 컨텍스트 조립
+# -----------------------------------------------------------------------------
 def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
-    q = state["question"]
+    """
+    질문에서 단과대/학과/학년 등 구조화 정보를 뽑는다.
+    - use_llm=False면 힌트(scope_depts)만 그대로 사용
+    - use_llm=True면 LLM으로 JSON 구조화
+    """
     use_llm = bool(state["opts"].get("use_llm", True))
     hints_depts = state["opts"].get("scope_depts") or []
-
     if "micro_mode" not in state["opts"]:
         state["opts"]["micro_mode"] = None
 
@@ -189,19 +202,23 @@ def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
         state["context_struct"] = {"faculties": [], "departments": hints_depts, "year": None, "need_slots": []}
         return state
 
+    q = state["question"]
     try:
         model_name = state["opts"].get("model_name", config.LLM_MODEL)
-        llm = _make_llm(model_name=model_name,
-                        temperature=float(state["opts"].get("temperature") or 0.0),
-                        max_tokens=int(state["opts"].get("max_tokens") or 400))  # 증가
+        llm = _make_llm(
+            model_name=model_name,
+            temperature=float(state["opts"].get("temperature") or 0.0),
+            max_tokens=int(state["opts"].get("max_tokens") or 400),
+        )
         provider = config.llm_provider_from_model(model_name)
+
         if provider == "anthropic":
+            # Claude 계열: JSON 문자열을 직접 파싱
             sys = ("너는 대학 학사요람 Q&A용 추출기야. "
-                   "입력 질문에서 단과대/학과/학년도/필요 슬롯을 JSON으로만 출력해. "
-                   '반드시 {"faculties":[],"departments":[],"year":null,"need_slots":[]} 키를 사용.')
+                   '입력에서 {"faculties":[],"departments":[],"year":null,"need_slots":[]} JSON만 출력.')
             prompt = ChatPromptTemplate.from_messages([
                 ("system", sys),
-                ("user", "질문: {q}\nJSON만 출력: faculties, departments, year, need_slots"),
+                ("user", "질문: {q}\nJSON만 출력"),
             ])
             out = llm.invoke(prompt.format_messages(q=q))
             raw = (out.content or "").strip()
@@ -220,12 +237,13 @@ def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
                     need_slots=parsed.get("need_slots") or [],
                 )
             else:
-                raise ValueError("parse_intent: JSON 파싱 실패(Claude)")
+                raise ValueError("parse_intent: JSON 파싱 실패")
         else:
-            sys = "너는 대학 학사요람 Q&A용 추출기다. 입력에서 단과대/학과/학년도/필요 슬롯을 구조화해라."
+            # OpenAI 계열: LangChain의 구조화 출력 사용
+            sys = "너는 대학 학사요람 Q&A용 추출기다. 단과대/학과/학년도/필요 슬롯을 구조화하여 JSON으로 돌려라."
             prompt = ChatPromptTemplate.from_messages([
                 ("system", sys),
-                ("user", "질문: {q}\n출력은 JSON으로. keys: faculties, departments, year, need_slots"),
+                ("user", "질문: {q}\nkeys: faculties, departments, year, need_slots"),
             ])
             out = llm.with_structured_output(QuerySchema).invoke(prompt.format_messages(q=q))
             qs = out
@@ -238,34 +256,42 @@ def node_parse_intent(state: Dict[str, Any]) -> Dict[str, Any]:
             "need_slots": list(qs.need_slots or []),
         }
         return state
+
     except Exception:
+        # LLM 실패 시 힌트만 반영
         state["context_struct"] = {"faculties": [], "departments": hints_depts, "year": None, "need_slots": []}
         return state
 
-
 def node_need_more(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    학과/단과대 정보가 하나도 없으면 '추가 설명 필요' 플래그를 세움.
+    프런트는 clarification 프롬프트를 표시해 추가 정보를 유도할 수 있다.
+    """
     if not bool(state["opts"].get("use_llm", True)):
         state["needs_clarification"] = False
         return state
     ctx = state["context_struct"]
-    if not ctx.get("departments") and not ctx.get("faculties"):
-        state["needs_clarification"] = True
+    state["needs_clarification"] = not (ctx.get("departments") or ctx.get("faculties"))
+    if state["needs_clarification"]:
         state["clarification_prompt"] = "어느 학과(또는 전공) 기준인지 알려주세요. 예) 디지털미디어학과 / 소프트웨어학과"
-    else:
-        state["needs_clarification"] = False
     return state
 
-
 def node_retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    검색 단계: lex(용어) + vector 혼합 검색으로 문서 히트 목록을 가져온다.
+    - rerank 옵션 사용 시 Cross-Encoder로 재정렬
+    """
     if state.get("needs_clarification") or state.get("error") or state.get("skip_rag"):
         state["retrieved"] = []
         return state
-    ctx = state["context_struct"]
-    opts = state["opts"]
+
+    ctx, opts = state["context_struct"], state["opts"]
     try:
         hits = retrieve(
             state["question"],
-            persist_dir=opts["persist_dir"], collection=opts["collection"], embedding_model=opts["embedding_model"],
+            persist_dir=opts["persist_dir"],
+            collection=opts["collection"],
+            embedding_model=opts["embedding_model"],
             topk=int(opts.get("topk") or config.TOPK),
             lex_weight=float(opts.get("lex_weight") or config.LEX_WEIGHT),
             scope_colleges=(ctx.get("faculties") or None),
@@ -275,7 +301,7 @@ def node_retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
             rerank=bool(opts.get("rerank") or False),
             rerank_model=opts.get("rerank_model") or "cross-encoder/ms-marco-MiniLM-L-6-v2",
             rerank_candidates=int(opts.get("rerank_candidates") or 30),
-            stitch_by_path=False,  # 섹션 확장 방식 사용
+            stitch_by_path=False,  # 경로 단위 확장 대신 섹션 조각 사용
         )
         state["retrieved"] = hits
         return state
@@ -284,27 +310,65 @@ def node_retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
         state["retrieved"] = []
         return state
 
-
 def node_build_context(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    히트 목록을 LLM 입력으로 사용할 컨텍스트 문자열로 조립한다.
+    - assemble_budget_chars / max_ctx_chunks로 길이 제어
+    """
     if state.get("error") or state.get("skip_rag"):
         state["context"] = ""
         return state
-    hits = state.get("retrieved") or []
-    opts = state["opts"]
-    budget = int(opts.get("assemble_budget_chars") or 60000)  # 기본값 줄임
-    max_items = int(opts.get("max_ctx_chunks") or 8)
-    state["context"] = _build_context_from_hits(hits, max_items=max_items, budget_chars=budget)
-    state["must_include"] = []
+
+    hits, opts = state.get("retrieved") or [], state["opts"]
+    state["context"] = _build_context_from_hits(
+        hits,
+        max_items=int(opts.get("max_ctx_chunks") or 8),
+        budget_chars=int(opts.get("assemble_budget_chars") or 60000),
+    )
+    state["must_include"] = []  # 필요 시 '반드시 포함할 스니펫' 지정
     return state
 
 
-# ==================== 후처리(질문 에코 제거/출처 병합) ====================
+# -----------------------------------------------------------------------------
+# 라우팅/스타일 가이드 + 후처리(인사/출처/문장 정리)
+# -----------------------------------------------------------------------------
+Category = Literal[
+    "major_list","major_detail","micro_list","micro_detail","course_detail",
+    "term_plan","track_rules","general_info","rule_info","practice_capstone",
+    "area_compare","other"
+]
 
+STYLE_GUIDES = {
+  # 필요한 카테고리만 우선 문서화(확장 용이)
+  "major_detail": "졸업요건/총 이수학점 위주 요약. 과목 나열은 최소화.",
+  "term_plan":    "학년/학기별 권장 순서를 불릿으로 간단히.",
+  "rule_info":    "학칙·규정을 근거로 인용. 반드시 출처 포함.",
+  "other":        "간결/불필요한 서론 금지.",
+}
+
+def _heuristic(q: str) -> str:
+    """휴리스틱 분류(간단 규칙). 확장 시 LLM 라우터와 혼합 가능."""
+    s = q.replace(" ", "").lower()
+    if any(k in s for k in ["졸업요건","총이수","교육과정","로드맵"]): return "major_detail"
+    if any(k in s for k in ["학기별","권장순서","학년","뭐들어야","수강"]): return "term_plan"
+    if any(k in s for k in ["학칙","규정","조항","정원","재수강"]): return "rule_info"
+    return "other"
+
+def node_classify(state: Dict[str, Any]) -> Dict[str, Any]:
+    """질문 카테고리를 정하고, 카테고리별 기본 옵션/스타일을 주입."""
+    hcat = _heuristic(state["question"])
+    state["category"] = hcat
+    state["style_guide"] = STYLE_GUIDES.get(hcat, STYLE_GUIDES["other"])
+    state["skip_rag"] = False  # 지금은 모든 카테고리에 대해 RAG 수행
+    return state
+
+
+# --- 후처리 유틸(중복 인사/따옴표 에코/출처 섹션 병합) -----------------------
 _QUOTED_LINE_RE = re.compile(r'^\s*[\"“”].*[\"“”]\s*$')
 _SRC_SPLIT_RE = re.compile(r"\n\s*출처\s*:\s*\n", re.I)
 
 def _strip_redundant_lead(text: str) -> str:
-    """맨 앞 따옴표 에코/“~에 대해 질문…” 같은 리드 제거."""
+    """첫 줄에 따옴표로 질문을 다시 쓰는 패턴 등 제거."""
     if not text:
         return text
     lines = text.splitlines()
@@ -316,7 +380,9 @@ def _strip_redundant_lead(text: str) -> str:
     return text
 
 def _merge_sources(text: str) -> str:
-    """출처 섹션이 여러 번이면 하나로 병합."""
+    """
+    모델이 실수로 '출처:' 섹션을 여러 번 생성하는 경우 1개로 병합.
+    """
     if not text:
         return text
     parts = _SRC_SPLIT_RE.split(text)
@@ -332,59 +398,70 @@ def _merge_sources(text: str) -> str:
                 merged.append(ln)
     return f"{body}\n\n출처:\n" + "\n".join(merged)
 
-
-# ==================== 답변 생성 ====================
-
 def _check_response_completeness(text: str) -> bool:
-    """응답의 완성도를 체크"""
+    """마침표/종결어미, 출처 존재 여부로 '완성도' 대략 점검."""
     text = (text or "").strip()
     if not text:
         return False
-    korean_endings = ('.', '요.', '다.', '니다.', '습니다.', '세요.', '어요.', '아요.', '지요.')
     if '출처:' in text or '출처\n' in text:
         return True
-    return text.endswith(korean_endings)
+    return text.endswith(('.', '요.', '다.', '니다.', '습니다.', '세요.', '어요.', '아요.', '지요.'))
 
+
+# -----------------------------------------------------------------------------
+# 답변 생성 노드
+# -----------------------------------------------------------------------------
 def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    최종 답변 생성 단계.
+    - LLM 비활성/히트 없음: 간단 안내 + 출처 요약
+    - LLM 활성: 시스템/사용자 프롬프트 구성 → 모델 호출 → 후처리
+    """
     if state.get("skip_rag") or state.get("needs_clarification") or state.get("error"):
         return state
 
     hits = state.get("retrieved") or []
     use_llm = bool(state["opts"].get("use_llm", True))
-    intro = _pick_intro(state.get("question", ""), state)
+    add_intro = bool(state["opts"].get("add_intro", True))  # 프런트에서 끌 수 있음
+    intro = _pick_intro(state.get("question", ""), state) if add_intro else ""
 
-    # LLM 비사용 또는 히트 없음 → 요약+출처(인사말 포함)
+    # --- LLM 미사용 또는 히트 없음 → 기본 안내 + 출처 요약
     if not use_llm or not hits:
         src = _summarize_sources(hits)
-        state["answer"] = f"{intro}\n\n검색된 문서 요약을 제공합니다.\n\n출처:\n{src}"
-        state["llm_answer"] = None
+        body = "검색된 문서 요약을 제공합니다."
+        final_txt = (f"{intro}\n\n{body}".strip() if intro else body)
+        if "출처:" not in final_txt:
+            final_txt += "\n\n출처:\n" + src
+        state["llm_answer"] = final_txt
+        state["answer"] = final_txt
         return state
 
+    # --- LLM 사용 경로
     micro_mode = state["opts"].get("micro_mode", "exclude")
     style_guide = state.get("style_guide") or ""
-    category = state.get("category") or "other"
     rule = {
-        "exclude": "1) '마이크로전공' 내용은 제외하고 본전공 중심으로 답하세요.",
-        "only": "1) 마이크로전공만 대상으로 답하세요.",
-        "include": "1) 본전공과 마이크로 모두 포함하되, 본전공을 우선하세요.",
+        "exclude": "1) 마이크로전공 내용은 제외하고 본전공 중심으로 답하세요.",
+        "only":    "1) 마이크로전공만 대상으로 답하세요.",
+        "include": "1) 본전공과 마이크로를 모두 포함하되 본전공을 우선하세요.",
     }.get(micro_mode, "1) 본전공을 우선하되 필요 시 마이크로도 포함하세요.")
 
     persona = (
         "아주대학교 학사안내 도우미다. 존댓말로 간결하게 답한다. "
-        "금지: 인사말을 생성하지 말 것, 질문 문장을 따옴표로 재진술하지 말 것, 불필요한 서론/결론 금지."
+        "금지: 인사말 생성 금지, 질문 재진술 금지, 불필요한 서론/결론 금지."
     )
-    sys = (f"{persona}\n"
-           f"CONTEXT 근거로만 답하세요. 근거 없으면 '문서에서 확인되지 않습니다'라고 명시.\n"
-           f"{rule}\n"
-           f"가이드({category}): {style_guide}\n"
-           "반드시 본문 다음에 '출처:' 섹션을 하나만 넣으세요(중복 금지).")
+    sys = (
+        f"{persona}\n"
+        f"CONTEXT 근거로만 답하세요. 근거 없으면 '문서에서 확인되지 않습니다'라고 명시.\n"
+        f"{rule}\n"
+        f"가이드: {style_guide}\n"
+        "본문 다음에 '출처:' 섹션 1개만 넣을 것(중복 금지)."
+    )
 
-    # 컨텍스트 길이 제한
+    # 컨텍스트 길이 방어
     context = state['context']
-    if len(context) > 50000:
-        context = context[:45000] + "\n...(내용이 길어 일부 생략)..."
+    if len(context) > 50_000:
+        context = context[:45_000] + "\n...(내용이 길어 일부 생략)..."
 
-    # ⛔ 인사말은 user 프롬프트에 넣지 않는다(모델이 인사말을 학습하지 않도록)
     usr = (
         f"질문: {state['question']}\n\n"
         f"CONTEXT:\n{context}\n\n"
@@ -394,14 +471,10 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
         "- 마지막에 '출처:' 섹션 1개"
     )
 
-    base_max_tokens = int(state["opts"].get("max_tokens") or 1500)
-    if category == "term_plan":
-        base_max_tokens = min(2500, base_max_tokens * 2)
-
     llm = _make_llm(
         model_name=state["opts"].get("model_name", config.LLM_MODEL),
         temperature=float(state["opts"].get("temperature") or config.TEMPERATURE),
-        max_tokens=base_max_tokens,
+        max_tokens=int(state["opts"].get("max_tokens") or 1500),
     )
 
     try:
@@ -409,18 +482,17 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
                           {"role": "user", "content": usr}])
         body = (out.content or "").strip()
 
-        # 사후 정리
-        body = _strip_redundant_lead(body)  # 질문 에코/따옴표 제거
-        body = _merge_sources(body)         # 출처 섹션 병합
+        # 후처리: 질문 에코 제거 + 중복 '출처:' 병합
+        body = _merge_sources(_strip_redundant_lead(body))
 
-        # 최종 조합: 인사말(앱) + 본문(모델)
-        final_txt = f"{intro}\n\n{body}".strip()
+        # 최종 조합(옵션에 따라 인사말 포함)
+        final_txt = (f"{intro}\n\n{body}".strip() if intro else body)
 
-        # 안전장치: 출처 없으면 붙이기
+        # 안전장치: 출처 누락 시 요약 출처 부착
         if "출처:" not in final_txt:
             final_txt += "\n\n출처:\n" + _summarize_sources(hits)
 
-        # 완성도 보정
+        # 완성도 보정(어미/마침표 없음 등)
         if not _check_response_completeness(final_txt):
             if not final_txt.endswith(("...", "…")):
                 final_txt += "..."
@@ -431,7 +503,10 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
         return state
 
     except Exception as e:
+        # 모델 호출 실패 시에도 출처 요약 포함
         state["error"] = f"llm_error: {e}"
-        state["answer"] = f"{intro}\n\n모델 호출에 실패했습니다.\n\n출처:\n" + _summarize_sources(hits)
+        fallback = ((f"{intro}\n\n" if intro else "") +
+                    "모델 호출에 실패했습니다.\n\n출처:\n" + _summarize_sources(hits))
+        state["answer"] = fallback
         state["llm_answer"] = None
         return state
