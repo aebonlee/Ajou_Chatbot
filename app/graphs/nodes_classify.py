@@ -25,18 +25,18 @@ STYLE_GUIDES = {
 }
 
 CATEGORY_CONFIG: Dict[str, Dict[str, Any]] = {
-    "major_list":     {"lex_weight": 0.9,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 20000,  "max_ctx_chunks": 4, "max_tokens": 900},
-    "major_detail":   {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 7000,   "max_ctx_chunks": 6, "max_tokens": 1200},
-    "micro_list":     {"lex_weight": 0.9,  "micro_mode": "only",    "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 12000,  "max_ctx_chunks": 4, "max_tokens": 800},
-    "micro_detail":   {"lex_weight": 0.8,  "micro_mode": "only",    "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 15000,  "max_ctx_chunks": 5, "max_tokens": 1000},
-    "course_detail":  {"lex_weight": 0.7,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 5000,   "max_ctx_chunks": 5, "max_tokens": 900},
-    "term_plan":      {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 6000,   "max_ctx_chunks": 6, "max_tokens": 1100},
-    "track_rules":    {"lex_weight": 0.75, "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 12000,  "max_ctx_chunks": 5, "max_tokens": 900},
-    "general_info":   {"lex_weight": 0.9,  "micro_mode": "exclude", "rerank": False,                         "assemble_budget_chars": 12000,  "max_ctx_chunks": 4, "max_tokens": 900},
-    "rule_info":      {"lex_weight": 0.7,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 1000},
-    "practice_capstone":{"lex_weight":0.8, "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 12000,  "max_ctx_chunks": 5, "max_tokens": 900},
-    "area_compare":   {"lex_weight": 0.85, "micro_mode": "include", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 1000},
-    "other":          {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 1000},
+    "major_list":     {"lex_weight": 0.9,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 20000,  "max_ctx_chunks": 4, "max_tokens": 2000},
+    "major_detail":   {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 7000,   "max_ctx_chunks": 6, "max_tokens": 2000},
+    "micro_list":     {"lex_weight": 0.9,  "micro_mode": "only",    "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 12000,  "max_ctx_chunks": 4, "max_tokens": 2000},
+    "micro_detail":   {"lex_weight": 0.8,  "micro_mode": "only",    "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 15000,  "max_ctx_chunks": 5, "max_tokens": 2000},
+    "course_detail":  {"lex_weight": 0.7,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 5000,   "max_ctx_chunks": 5, "max_tokens": 2000},
+    "term_plan":      {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 6000,   "max_ctx_chunks": 6, "max_tokens": 2000},
+    "track_rules":    {"lex_weight": 0.75, "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 12000,  "max_ctx_chunks": 5, "max_tokens": 2000},
+    "general_info":   {"lex_weight": 0.9,  "micro_mode": "exclude", "rerank": False,                         "assemble_budget_chars": 12000,  "max_ctx_chunks": 4, "max_tokens": 2000},
+    "rule_info":      {"lex_weight": 0.7,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 50, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 2000},
+    "practice_capstone":{"lex_weight":0.8, "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 12000,  "max_ctx_chunks": 5, "max_tokens": 2000},
+    "area_compare":   {"lex_weight": 0.85, "micro_mode": "include", "rerank": True,  "rerank_candidates": 40, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 2000},
+    "other":          {"lex_weight": 0.8,  "micro_mode": "exclude", "rerank": True,  "rerank_candidates": 30, "assemble_budget_chars": 15000,  "max_ctx_chunks": 6, "max_tokens": 2000},
 }
 
 def _apply_category_overrides(state: Dict[str, Any], category: str) -> None:

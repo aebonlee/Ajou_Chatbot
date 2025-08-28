@@ -1,7 +1,9 @@
 from typing import Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
-from .state import GraphState
-from .nodes import node_parse_intent, node_need_more, node_retrieve, node_build_context, node_answer
+from .state import GraphState, GraphStateInfo
+from .nodes import node_parse_intent, node_need_more, node_retrieve, node_build_context, node_answer, retrieve_node, \
+    generate_node, fallback_node, should_generate
+from langchain_core.runnables import RunnableConfig
 from .nodes_classify import node_classify
 from app.core import config
 from langchain_core.prompts import ChatPromptTemplate
@@ -112,6 +114,68 @@ def run_rag_graph(
 
 
 
+#--------------------------------------------
+# 학사공통
+# -------------------------------------------
+
+def make_graph():
+    graph = StateGraph(GraphStateInfo)
+
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("generate", generate_node)
+    graph.add_node("fallback", fallback_node)
+
+    graph.set_entry_point("retrieve")
+
+    graph.add_conditional_edges(
+        "retrieve",
+        should_generate,
+        {
+            "generate": "generate",
+            "fallback": "fallback",
+        },
+    )
+
+    graph.add_edge("generate", END)
+    graph.add_edge("fallback", END)
+
+    return graph.compile()
+
+_pipeline_cache = {}
+
+def get_cached_pipeline():
+    """그래프 파이프라인을 캐싱하여 반환"""
+    if "graph" in _pipeline_cache:
+        return _pipeline_cache["graph"]
+    app = make_graph()
+    _pipeline_cache["graph"] = app
+    return app
+
+
+def route_query_sync(question: str, departments: List[str] = None, session_id: str = "default"):
+    """
+    그래프를 동기적으로 실행하는 함수.
+    departments 리스트를 받아 메타데이터 필터링을 수행합니다.
+    """
+    if departments is None:
+        departments = []
+
+    # get_cached_pipeline()은 이제 모든 요청에 대해 동일한 그래프를 반환해야 합니다.
+    app = get_cached_pipeline()
+    config = RunnableConfig(configurable={"session_id": session_id})
+
+    # GraphState에 맞게 'question'과 'departments'를 전달합니다.
+    inputs = {"question": question, "departments": departments}
+
+    final_state = app.invoke(inputs, config=config)
+
+    return {
+        "answer": final_state.get("answer", "오류가 발생했습니다."),
+        "documents": final_state.get("documents", [])  # 디버깅을 위해 검색된 문서도 반환
+    }
+
+
+
 
 
 ################공지사항#####################
@@ -120,20 +184,22 @@ def run_rag_graph(
 # 프롬프트 템플릿 정의
 # -------------------------------
 template = """
-당신은 대학 공지사항을 정확하게 검색하여 제공하는 친절한 AI 비서입니다.
-아래에 제공된 "문서" 내용을 바탕으로 사용자의 "질문"에 답변하세요.
+당신은 아주대학교의 친근하고 도움이 되는 공지사항 안내 도우미입니다.
+아래에 제공된 "문서" 내용을 바탕으로 사용자의 "질문"에 친근하게 답변하세요.
 
 **답변 형식:**
-- 답변은 찾은 공지사항 리스트를 아래 형식에 맞춰서 제공해야 합니다.
-- 만약 여러 개의 공지사항이 있다면, 모두 이 형식으로 리스트업해주세요.
-- 각 공지사항은 다음 형식을 따라야 합니다:
-[제목]: [공지사항의 제목]
-[URL]: [공지사항의 URL]
+- "네, [질문내용]에 대한 공지사항을 찾아드릴게요!" 로 친근하게 시작
+- 찾은 공지사항들을 아래 형식으로 정리해서 제공:
+
+📌 **[제목]**
+🔗 **링크**: [URL]
+📝 **요약**: [주요 내용 1-2줄]
 
 **특별 지시:**
-1. 만약 제공된 "문서"에 사용자의 질문과 관련된 내용이 전혀 없다면, "죄송합니다. 제공된 문서에는 해당 정보가 없습니다."라고 답하세요.
-2. 사용자가 특정 학과나 단과대학, 또는 공지 유형(예: 장학)을 언급했지만, 관련 문서가 검색되지 않았을 경우, 사용자에게 해당 정보를 다시 명확하게 물어보세요.
-   - 예시 질문: "어떤 학과의 공지사항을 찾으시나요?" 또는 "어떤 종류의 공지를 찾으시나요?"
+1. 제공된 문서에 관련 공지사항이 있으면 위 형식으로 정리해주세요.
+2. 여러 공지가 있으면 모두 📌 아이콘과 함께 나열해주세요.
+3. 관련 문서가 전혀 없다면: "죄송합니다. 현재 해당 내용의 공지사항을 찾을 수 없네요. 다른 키워드로 검색해보시거나, 학과 사무실에 직접 문의해보시는 건 어떨까요?"
+4. 마지막에 "더 자세한 내용은 위 링크를 통해 확인하실 수 있습니다!" 로 마무리
 
 ---
 문서:
@@ -146,26 +212,51 @@ template = """
 """
 prompt = ChatPromptTemplate.from_template(template)
 
+
+def format_docs(docs):
+    lines = []
+    for d in docs or []:
+        md = getattr(d, "metadata", {}) or {}
+        title = md.get("title") or ""
+        url = md.get("url") or ""
+
+        # 핵심: 실제 문서 내용도 포함
+        content = getattr(d, 'page_content', '') or ''
+
+        lines.append(f"- 제목: {title}")
+        lines.append(f"- URL: {url}")
+        if content:
+            lines.append(f"- 내용: {content}")
+        lines.append("")  # 빈 줄로 구분
+
+    return "\n".join(lines) if lines else "(검색 결과 없음)"
+
 # 입력 전처리 (question + filter 동시 생성)
 # -------------------------------
 def enrich_inputs(x):
-    return {
-        "question": x["question"],
-        "filter": get_enhanced_filter(x["question"])
-    }
+    f = get_enhanced_filter(x["question"])
+    print("[NOTICE] filter =", f)
+    return {"question": x["question"], "filter": f}
 
+def _ctx_builder(d):
+    docs = dynamic_retriever(d["question"], d["filter"])
+    print(f"[NOTICE] retrieved {len(docs)} docs")  # 🔎 개수 확인
+    ctx = format_docs(docs)
+    print("[NOTICE] context:\n", ctx)              # 🔎 LLM에 주는 문자열
+    return {"context": ctx, "question": d["question"]}
 
 #  RAG 체인 구축
 llm = ChatGoogleGenerativeAI(model=LLM_MODEL_NOTICE)
 
+
 rag_chain = (
     RunnableLambda(enrich_inputs)
     | {
-        "context": RunnableLambda(lambda d: dynamic_retriever(d["question"], d["filter"])),
         "question": RunnableLambda(lambda d: d["question"]),
+        "raw_docs": RunnableLambda(lambda d: dynamic_retriever(d["question"], d["filter"])),
       }
+    | RunnableLambda(lambda d: {"question": d["question"], "context": format_docs(d["raw_docs"])})
     | prompt
     | llm
     | StrOutputParser()
 )
-

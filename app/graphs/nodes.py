@@ -16,6 +16,14 @@ LangGraph에서 사용하는 '노드' 모음.
 
 from typing import List, Dict, Any, Literal
 import json, re, random, os
+from app.services.retriever import (
+    get_cached_retrievers,
+    get_all_cached_chunks,
+    get_filtered_bm25_retriever,
+    weighted_reciprocal_rank_fusion,
+    format_docs,
+)
+from app.core.config import rag_logger
 
 # LLM 클라이언트 (사용 가능한 것만 import)
 try:
@@ -48,6 +56,96 @@ INTRO_TEMPLATES_GENERIC = [
     "좋은 질문이에요! 아래에 핵심만 정리해 드릴게요.",
     "문의 감사합니다. 요점만 빠르게 정리해 드립니다.",
 ]
+
+# 학과별 연락처 및 소속 정보 데이터
+DEPARTMENT_INFO = {
+    # 공과대학 소속
+    "건설시스템공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2520"]
+    },
+    "건축학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2410"]
+    },
+    "교통시스템공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2530"]
+    },
+    "기계공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2340"]
+    },
+    "미래자동차연계전공": {
+        "college": "공과대학",
+        "contacts": ["031-219-2340"]  # 기계공학과와 동일하다고 가정
+    },
+    "산업공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2350"]
+    },
+    "융합시스템공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2360"]
+    },
+    "응용화학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2370"]
+    },
+    "첨단신소재공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2380"]
+    },
+    "화학공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2390"]
+    },
+    "환경안전공학과": {
+        "college": "공과대학",
+        "contacts": ["031-219-2400"]
+    },
+
+    # 소프트웨어융합대학 소속
+    "국방디지털융합학과": {
+        "college": "소프트웨어융합대학",
+        "contacts": ["031-219-2640"]
+    },
+    "데이터보안·활용융합 연계전공": {
+        "college": "소프트웨어융합대학",
+        "contacts": ["031-219-2650"]
+    },
+    "디지털미디어학과": {
+        "college": "소프트웨어융합대학",
+        "contacts": ["031-219-2630"]
+    },
+    "사이버보안학과": {
+        "college": "소프트웨어융합대학",
+        "contacts": ["031-219-2610"]
+    },
+    "소프트웨어학과": {
+        "college": "소프트웨어융합대학",
+        "contacts": [
+            "수업(수강신청), 학적관리(전과 등): 031-219-2431",
+            "졸업요건, 현장실습과목: 031-219-1687",
+            "장학, 자기주도과목, 학생행사: 031-219-2430"
+        ]
+    },
+    "인공지능융합학과": {
+        "college": "소프트웨어융합대학",
+        "contacts": ["031-219-2620"]
+    },
+    "인문사회데이터분석전공": {
+        "college": "소프트웨어융합대학",
+        "contacts": ["031-219-2660"]
+    }
+}
+
+# 단과대별 요람 링크
+COLLEGE_BULLETIN_LINKS = {
+    "공과대학": "https://www.ajou.ac.kr/kr/bachelor/bulletin.do?mode=list&srSearchKey=&srCategoryId=79&srSearchVal=",
+    "소프트웨어융합대학": "https://www.ajou.ac.kr/kr/bachelor/bulletin.do?mode=list&srSearchKey=&srCategoryId=80&srSearchVal="
+}
+
 
 _KOR_WS = re.compile(r"\s+")
 _DEPT_PAT = re.compile(r"([가-힣A-Za-z0-9]+학과)")
@@ -106,6 +204,73 @@ def _pick_intro(question: str, state: Dict[str, Any]) -> str:
     return (random.choice(INTRO_TEMPLATES_WITH_TOPIC).format(topic=t)) if t else random.choice(INTRO_TEMPLATES_GENERIC)
 
 
+def _extract_departments_from_state(state: Dict[str, Any]) -> List[str]:
+    """state에서 학과명 목록을 추출"""
+    departments = []
+
+    # context_struct에서 추출
+    ctx = state.get("context_struct", {})
+    if ctx.get("departments"):
+        departments.extend(ctx["departments"])
+
+    # opts에서 scope_depts 추출
+    opts = state.get("opts", {})
+    if opts.get("scope_depts"):
+        departments.extend(opts["scope_depts"])
+
+    # 중복 제거 및 정규화
+    unique_depts = list(set(departments))
+    return [dept for dept in unique_depts if dept in DEPARTMENT_INFO]
+
+
+def _generate_department_info_appendix(departments: List[str]) -> str:
+    """학과 정보 부록 생성"""
+    if not departments:
+        return ""
+
+    # 단과대별로 그룹핑
+    colleges_info = {}
+    for dept in departments:
+        if dept not in DEPARTMENT_INFO:
+            continue
+
+        dept_info = DEPARTMENT_INFO[dept]
+        college = dept_info["college"]
+
+        if college not in colleges_info:
+            colleges_info[college] = []
+        colleges_info[college].append(dept)
+
+    if not colleges_info:
+        return ""
+
+    appendix_parts = [
+        "덧붙여서 더 자세한 정보는 아래의 요람 문서를 확인하시거나, 학과사무실에 연락하시면 더 정확하고 상세한 정보를 얻으실 수 있어요!"
+    ]
+
+    # 요람 링크 추가
+    appendix_parts.append("\n【아주대학교 요람】")
+    for college, depts in colleges_info.items():
+        if college in COLLEGE_BULLETIN_LINKS:
+            appendix_parts.append(f"* {college}: {COLLEGE_BULLETIN_LINKS[college]}")
+
+    # 연락처 정보 추가
+    appendix_parts.append("\n【학과사무실 연락처】")
+    for college, depts in colleges_info.items():
+        for dept in sorted(depts):  # 학과명 정렬
+            dept_info = DEPARTMENT_INFO[dept]
+            contacts = dept_info["contacts"]
+
+            appendix_parts.append(f"* {dept}")
+            for contact in contacts:
+                if ":" in contact:  # 구체적인 업무 구분이 있는 경우
+                    appendix_parts.append(f"   * {contact}")
+                else:  # 단순 전화번호
+                    appendix_parts.append(f"   * {contact}")
+
+    return "\n".join(appendix_parts)
+
+
 # -----------------------------------------------------------------------------
 # 공용 텍스트/컨텍스트 유틸
 # -----------------------------------------------------------------------------
@@ -131,15 +296,37 @@ def _summarize_sources(hits: List[Dict[str, Any]], max_items: int = 8) -> str:
     """
     if not hits:
         return "(없음)"
-    lines = []
-    for i, h in enumerate(hits[:max_items], 1):
+    seen_sources = set()
+    unique_sources = []
+
+    for h in hits[:max_items * 2]:  # 더 많이 확인해서 중복 제거
         meta = h.get("metadata") or {}
-        title = (meta.get("title") or "").strip()
         path = _safe_path(h)
-        name = title or (os.path.basename(path) or path)
-        name = name.replace("_", " ")
-        lines.append(f"{i}. {name}")
-    return "\n".join(lines)
+
+        # 경로에서 핵심 부분만 추출
+        if " > " in path:
+            parts = path.split(" > ")
+            if len(parts) >= 3:
+                # "소프트웨어융합대학 > 디지털미디어학과 > 디지털미디어전공"
+                # -> "디지털미디어학과 디지털미디어전공"
+                simplified = f"{parts[1]} {parts[2]}"
+            else:
+                simplified = parts[-1]  # 마지막 부분만
+        else:
+            simplified = os.path.basename(path) or path
+
+        simplified = simplified.replace("_", " ")
+
+        if simplified not in seen_sources and len(unique_sources) < max_items:
+            seen_sources.add(simplified)
+            unique_sources.append(simplified)
+
+    if len(unique_sources) == 1:
+        return f'자세한 내용은 "{unique_sources[0]}"에서 확인할 수 있습니다.'
+    elif len(unique_sources) <= 3:
+        return f'자세한 내용은 "{", ".join(unique_sources)}" 등에서 확인할 수 있습니다.'
+    else:
+        return f'자세한 내용은 "{unique_sources[0]}" 등 관련 문서에서 확인할 수 있습니다.'
 
 def _build_context_from_hits(hits: List[Dict[str, Any]], *, max_items: int, budget_chars: int) -> str:
     """
@@ -398,13 +585,20 @@ def _merge_sources(text: str) -> str:
                 merged.append(ln)
     return f"{body}\n\n출처:\n" + "\n".join(merged)
 
+
 def _check_response_completeness(text: str) -> bool:
     """마침표/종결어미, 출처 존재 여부로 '완성도' 대략 점검."""
     text = (text or "").strip()
     if not text:
         return False
+
+    # 학과 정보 부록이 있으면 완성된 것으로 간주
+    if '【학과사무실 연락처】' in text or '【아주대학교 요람】' in text:
+        return True
+
     if '출처:' in text or '출처\n' in text:
         return True
+
     return text.endswith(('.', '요.', '다.', '니다.', '습니다.', '세요.', '어요.', '아요.', '지요.'))
 
 
@@ -416,45 +610,61 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     최종 답변 생성 단계.
     - LLM 비활성/히트 없음: 간단 안내 + 출처 요약
     - LLM 활성: 시스템/사용자 프롬프트 구성 → 모델 호출 → 후처리
+    - 특정 카테고리의 경우 학과 정보 부록 추가
     """
     if state.get("skip_rag") or state.get("needs_clarification") or state.get("error"):
         return state
 
     hits = state.get("retrieved") or []
     use_llm = bool(state["opts"].get("use_llm", True))
-    add_intro = bool(state["opts"].get("add_intro", True))  # 프런트에서 끌 수 있음
-    intro = _pick_intro(state.get("question", ""), state) if add_intro else ""
+    category = state.get("category", "")
+
+    # 학과 정보 부록을 추가할 카테고리들
+    dept_info_categories = {"major_list", "major_detail", "micro_list", "micro_detail", "course_detail", "term_plan"}
+    should_add_dept_info = category in dept_info_categories
 
     # --- LLM 미사용 또는 히트 없음 → 기본 안내 + 출처 요약
     if not use_llm or not hits:
         src = _summarize_sources(hits)
         body = "검색된 문서 요약을 제공합니다."
-        final_txt = (f"{intro}\n\n{body}".strip() if intro else body)
+        final_txt = body
         if "출처:" not in final_txt:
             final_txt += "\n\n출처:\n" + src
+
+        # 학과 정보 부록 추가
+        if should_add_dept_info:
+            departments = _extract_departments_from_state(state)
+            dept_appendix = _generate_department_info_appendix(departments)
+            if dept_appendix:
+                final_txt += "\n\n" + dept_appendix
+
         state["llm_answer"] = final_txt
         state["answer"] = final_txt
         return state
 
-    # --- LLM 사용 경로
+    # --- LLM 사용 경로 (기존 코드 동일)
     micro_mode = state["opts"].get("micro_mode", "exclude")
     style_guide = state.get("style_guide") or ""
     rule = {
         "exclude": "1) 마이크로전공 내용은 제외하고 본전공 중심으로 답하세요.",
-        "only":    "1) 마이크로전공만 대상으로 답하세요.",
+        "only": "1) 마이크로전공만 대상으로 답하세요.",
         "include": "1) 본전공과 마이크로를 모두 포함하되 본전공을 우선하세요.",
     }.get(micro_mode, "1) 본전공을 우선하되 필요 시 마이크로도 포함하세요.")
 
     persona = (
-        "아주대학교 학사안내 도우미다. 존댓말로 간결하게 답한다. "
-        "금지: 인사말 생성 금지, 질문 재진술 금지, 불필요한 서론/결론 금지."
+        "아주대학교의 친근하고 도움이 되는 학사안내 도우미입니다. "
+        "존댓말로 친근하게 답변하며, '네, ~에 대해 간략히 설명해 드릴게요!' 같은 인사말로 시작합니다."
     )
+
     sys = (
         f"{persona}\n"
-        f"CONTEXT 근거로만 답하세요. 근거 없으면 '문서에서 확인되지 않습니다'라고 명시.\n"
-        f"{rule}\n"
-        f"가이드: {style_guide}\n"
-        "본문 다음에 '출처:' 섹션 1개만 넣을 것(중복 금지)."
+        f"답변 형식:\n"
+        f"- '네, [질문 내용]에 대해 간략히 설명해 드릴게요!' 로 시작\n"
+        f"- CONTEXT 근거로만 답변하고, 근거가 없으면 '문서에서 확인되지 않습니다'라고 명시\n"
+        f"- {rule}\n"
+        f"- 가이드: {style_guide}\n"
+        f"- 불릿 포인트와 숫자 목록을 활용해 보기 쉽게 구성\n"
+        f"- 답변 내용만 작성하고 별도 출처 섹션은 추가하지 마세요"
     )
 
     # 컨텍스트 길이 방어
@@ -465,10 +675,10 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     usr = (
         f"질문: {state['question']}\n\n"
         f"CONTEXT:\n{context}\n\n"
-        "요구사항:\n"
-        "- 인사말 없이 본문만 작성\n"
-        "- 불릿/숫자 목록은 간결하게\n"
-        "- 마지막에 '출처:' 섹션 1개"
+        f"요구사항:\n"
+        f"- '네, [질문내용]에 대해 간략히 설명해 드릴게요!' 로 친근하게 시작\n"
+        f"- 불릿 포인트나 숫자 목록으로 구조화\n"
+        f"- 내용만 작성하고 출처는 따로 추가하지 마세요"
     )
 
     llm = _make_llm(
@@ -485,14 +695,20 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
         # 후처리: 질문 에코 제거 + 중복 '출처:' 병합
         body = _merge_sources(_strip_redundant_lead(body))
 
-        # 최종 조합(옵션에 따라 인사말 포함)
-        final_txt = (f"{intro}\n\n{body}".strip() if intro else body)
+        final_txt = body
 
-        # 안전장치: 출처 누락 시 요약 출처 부착
-        if "출처:" not in final_txt:
-            final_txt += "\n\n출처:\n" + _summarize_sources(hits)
+        # 안전장치: 출처 누락 시 요약 출처 부착 (단, "자세한 내용은"이 이미 있으면 생략)
+        if "출처:" not in final_txt and "자세한 내용은" not in final_txt:
+            final_txt += "\n\n" + _summarize_sources(hits)
 
-        # 완성도 보정(어미/마침표 없음 등)
+        # 학과 정보 부록 추가
+        if should_add_dept_info:
+            departments = _extract_departments_from_state(state)
+            dept_appendix = _generate_department_info_appendix(departments)
+            if dept_appendix:
+                final_txt += "\n\n" + dept_appendix
+
+        # 완성도 보정을 부록 추가 후에 실행
         if not _check_response_completeness(final_txt):
             if not final_txt.endswith(("...", "…")):
                 final_txt += "..."
@@ -505,8 +721,107 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         # 모델 호출 실패 시에도 출처 요약 포함
         state["error"] = f"llm_error: {e}"
-        fallback = ((f"{intro}\n\n" if intro else "") +
-                    "모델 호출에 실패했습니다.\n\n출처:\n" + _summarize_sources(hits))
+        fallback = "모델 호출에 실패했습니다.\n\n" + _summarize_sources(hits)
+
+        # 학과 정보 부록 추가 (오류 상황에서도)
+        if should_add_dept_info:
+            departments = _extract_departments_from_state(state)
+            dept_appendix = _generate_department_info_appendix(departments)
+            if dept_appendix:
+                fallback += "\n\n" + dept_appendix
+
         state["answer"] = fallback
         state["llm_answer"] = None
         return state
+
+#--------------------------------------------
+# 학사공통
+# -------------------------------------------
+
+
+RETRIEVER_TOP_K = 7
+CONFIDENCE_THRESHOLD = 0.02
+
+def retrieve_node(state: Dict[str, Any]):
+    question = state["question"]
+    departments = state.get("departments")
+    rag_logger.info(f"--- Retrieving for: '{question}' in {departments} ---")
+
+    chroma_r = get_cached_retrievers()
+    search_kwargs = {"k": 10}
+    if departments:
+        if len(departments) == 1:
+            filter_query = {"source": departments[0]}
+        else:
+            filter_query = {"$or": [{"source": dept} for dept in departments]}
+        search_kwargs["filter"] = filter_query
+
+    chroma_results = chroma_r.invoke(question, **search_kwargs)
+    all_chunks = get_all_cached_chunks()
+    bm25_r = get_filtered_bm25_retriever(all_chunks, departments)
+    bm25_results = bm25_r.invoke(question)
+
+    fused_results = weighted_reciprocal_rank_fusion(
+        [chroma_results, bm25_results], weights=[0.5, 0.5], c=0
+    )
+
+    if not fused_results:
+        return {"documents": [], "retrieval_success": False, "top_score": 0.0}
+
+    return {"documents": fused_results, "retrieval_success": True, "top_score": fused_results[0][1]}
+
+
+def generate_node(state: Dict[str, Any]):
+    rag_logger.info("--- Generating Answer ---")
+    context = format_docs([doc for doc, _ in state["documents"][:RETRIEVER_TOP_K]])
+
+    system_prompt = (
+        "당신은 아주대학교의 친근하고 도움이 되는 학사안내 도우미입니다. "
+        "한국어로 친근하게 답변하며, 제공된 문서를 기반으로 정확한 정보를 안내합니다."
+    )
+
+    user_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", """
+다음 문서들을 바탕으로 질문에 답변해주세요:
+
+{context}
+
+사용자 질문: {question}
+
+답변 형식:
+- "네, {질문 주제}에 대해 간략히 설명해 드릴게요!" 로 친근하게 시작
+- 번호나 불릿 포인트로 구조화된 답변 제공
+- 구체적인 수치나 조건이 있으면 명확히 제시
+- 마지막에 "자세한 내용은 '학칙' 또는 '대학생활안내'에서 확인하실 수 있습니다." 형태로 출처 안내
+        """)
+    ])
+
+    llm = _make_llm(
+        model_name=config.LLM_MODEL,
+        temperature=config.TEMPERATURE,
+        max_tokens=config.MAX_TOKENS,
+    )
+    chain = user_prompt | llm
+    result = chain.invoke({"context": context, "question": state["question"]})
+    return {"answer": result.content}
+
+def fallback_node(state: Dict[str, Any]):
+    rag_logger.info("--- Fallback Triggered ---")
+    reason = state.get("fallback_reason", "알 수 없는 이유")
+    return {"answer": reason}
+
+def should_generate(state: Dict[str, Any]) -> str:
+    if not state.get("retrieval_success"):
+        rag_logger.info("--- Decision: No documents found, routing to fallback. ---")
+        state["fallback_reason"] = "관련 문서를 찾을 수 없습니다."
+        return "fallback"
+    top_score = state.get("top_score", 0.0)
+    rag_logger.info(f"--- Top Score: {top_score:.4f} ---")
+    if top_score < CONFIDENCE_THRESHOLD:
+        rag_logger.info(f"--- Decision: Score below threshold, routing to fallback. ---")
+        state["fallback_reason"] = f"관련성이 높은 문서를 찾지 못해 답변하기 어렵습니다. (신뢰도: {top_score:.3f})"
+        return "fallback"
+    else:
+        rag_logger.info("--- Decision: Score is sufficient, routing to generate. ---")
+        return "generate"

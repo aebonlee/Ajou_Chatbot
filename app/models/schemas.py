@@ -43,7 +43,22 @@ class RouteSchema(BaseModel):
     primary: Category
     secondary: List[Category] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
-    
+
+
+# --------------------------------------------
+# 학사공통
+# -------------------------------------------
+
+class InfoRequest(BaseModel):
+    question: str
+    selected_list: List[str] = []  # corpus_type (rules, overview, campus_life)
+
+
+class InfoResponse(BaseModel):
+    answer: str
+    question: str
+
+
 class NoticeQuery(BaseModel):
     question: str
 

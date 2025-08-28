@@ -1,5 +1,5 @@
 import re
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 
 # ------------ 공통 정규식(헤더/학년/학기) ------------
 HDR_RE = re.compile(r"^(#{1,6})\s+(.*)\s*$")
@@ -69,5 +69,3 @@ def tokenize_ko(text: str) -> List[str]:
         if _re.fullmatch(r"[가-힣]+", s):
             out.extend(_ngrams(s, 2)); out.extend(_ngrams(s, 3))
     return out
-
-# (참고) path_of(): 지금은 [PATH] 프리픽스를 문서에 넣지 않으므로 미사용

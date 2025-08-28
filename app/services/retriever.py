@@ -5,18 +5,25 @@
 - 질문에 학년/학기 감지 시, 메타 필터로 바로 해당 term 섹션 전체 확장
 """
 from typing import List, Dict, Any, Optional, Tuple
+from langchain_core.documents import Document
 import re
-import unicodedata
 import math
 import numpy as np
 from collections import defaultdict
 from rank_bm25 import BM25Okapi
-from langchain_community.vectorstores import Chroma
 from .storage import get_client, get_collection, get_all, get_where_all
 from .textutil import tokenize_ko, normalize_numbers, detect_year_semester_in_query
-from app.core.config import EMBEDDING_MODEL,PERSIST_DIR_NOTICE
+from .indexer import process_documents
+import os
+from langchain_community.retrievers import BM25Retriever
+from app.core.config import rag_logger, PERSIST_DIR_INFO
+from konlpy.tag import Okt
+from langchain_huggingface import HuggingFaceEmbeddings
+import torch
+from app.core.config import EMBEDDING_MODEL
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from datetime import datetime, timedelta
+from langchain_chroma import Chroma
 
 EPS = 1e-9
 
@@ -390,7 +397,168 @@ def retrieve(
     if debug:
         paths = [h.get("path") for h in hits[:min(5, len(hits))]]
         print(f"[Retriever] expanded sections: {paths}")
+
     return hits
+
+# =============================================================================
+# 학사공통
+# =============================================================================
+
+TOKENIZER = Okt()
+model_name = "BAAI/bge-m3"
+
+# --- GPU 자동 감지 로직 ---
+# torch.cuda.is_available()가 GPU의 존재 여부를 확인합니다.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+rag_logger.info(f"✅ Using device: {device}")
+# ---
+
+model_kwargs = {'device': device}
+encode_kwargs = {'normalize_embeddings': True}
+
+embeddings = HuggingFaceEmbeddings(
+    model_name=model_name,
+    model_kwargs=model_kwargs,
+    encode_kwargs=encode_kwargs
+)
+
+# 전역 캐시 딕셔너리 (하나만 존재해야 합니다)
+_retriever_cache = {}
+
+def get_filtered_bm25_retriever(all_chunks: List[Document], departments: List[str] = None) -> BM25Retriever:
+    """departments에 해당하는 문서들로만 BM25 retriever를 동적으로 생성합니다."""
+    if not departments:
+        filtered_chunks = all_chunks
+    else:
+        filtered_chunks = [
+            doc for doc in all_chunks
+            if doc.metadata.get("source") in departments
+        ]
+
+    if not filtered_chunks:
+        # 필터링 결과 문서가 없을 경우를 대비해 빈 문서를 담은 retriever 생성
+        rag_logger.warning(f"BM25: No documents found for departments: {departments}")
+        return BM25Retriever.from_documents(
+            [Document(page_content="내용 없음")],
+            preprocess_func=lambda x: TOKENIZER.morphs(x)
+        )
+
+    bm25_r = BM25Retriever.from_documents(
+        filtered_chunks,
+        preprocess_func=lambda x: TOKENIZER.morphs(x)
+    )
+    bm25_r.k = 10
+    rag_logger.info(
+        f"✅ Dynamically created BM25 retriever with {len(filtered_chunks)} chunks for {departments or 'all documents'}")
+    return bm25_r
+
+def get_all_cached_chunks() -> List[Document]:
+    """캐시된 전체 문서 청크들을 반환합니다."""
+    # 캐시에서 'chunks' 키로 저장된 청크 리스트를 직접 가져옴
+    if "chunks" in _retriever_cache:
+        return _retriever_cache["chunks"]
+
+    # 캐시가 없다면 retriever 생성을 통해 캐시를 채움
+    get_cached_retrievers()
+    return _retriever_cache.get("chunks", [])
+
+# === wRRF ===
+def weighted_reciprocal_rank_fusion(
+        all_retriever_results: List[List[Document]],
+        weights: List[float],
+        c: int = 60
+) -> List[Tuple[Document, float]]:
+    content_to_document = {}
+    for single_result_list in all_retriever_results:
+        for doc in single_result_list:
+            if doc.page_content not in content_to_document:
+                content_to_document[doc.page_content] = doc
+
+    fused_scores = {}
+    for single_result_list, weight in zip(all_retriever_results, weights):
+        for rank, doc in enumerate(single_result_list, start=1):
+            doc_key = doc.page_content
+            if doc_key not in fused_scores:
+                fused_scores[doc_key] = 0.0
+            score = weight * (1 / (rank + c))
+            fused_scores[doc_key] += score
+
+    sorted_results = sorted(fused_scores.items(), key=lambda x: -x[1])
+    final_sorted_docs = [(content_to_document[content], score) for content, score in sorted_results]
+    return final_sorted_docs
+
+def format_docs(docs, max_chars: int = 1800) -> str:
+    out = []
+    for i, d in enumerate(docs, 1):
+        src = d.metadata.get("title", d.metadata.get("source", "doc"))
+        page = d.metadata.get("page", "?")
+        body = d.page_content[:max_chars].replace("\u200b", "").strip()
+        out.append(f"[{i}] {src}, page={page}\n{body}")
+    return "\n\n---\n\n".join(out)
+
+def load_chroma(persistent_dir: str, chunks: List) -> Chroma:
+    if os.path.exists(persistent_dir) and len(os.listdir(persistent_dir)) > 0:
+        rag_logger.info(f"✅ Loading existing ChromaDB from: {persistent_dir}")
+        return Chroma(persist_directory=persistent_dir, embedding_function=embeddings)
+
+    rag_logger.info(f"✅ Creating new ChromaDB at: {persistent_dir}")
+    vs = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=persistent_dir)
+    return vs
+
+def get_cached_retrievers():
+    """
+    통합 DB와 전체 청크 리스트를 로드/생성하고 캐시합니다.
+    1) storage/chroma-info가 존재하고 비어있지 않으면: 기존 DB 로드 → 청크 재구성
+    2) 없으면: MD 파일을 청킹해서 새 DB 생성
+    """
+    if "unified" in _retriever_cache:
+        return _retriever_cache["unified"]
+
+    rag_logger.info("⏳ Building/Loading unified retriever for /info ...")
+
+    # --- 1) 기존 Chroma가 있으면 먼저 로드 ---
+    if os.path.isdir(PERSIST_DIR_INFO) and os.listdir(PERSIST_DIR_INFO):
+        rag_logger.info(f"✅ Loading existing ChromaDB from: {PERSIST_DIR_INFO}")
+        vector_vs = Chroma(persist_directory=PERSIST_DIR_INFO, embedding_function=embeddings)
+        chroma_r = vector_vs.as_retriever(search_kwargs={"k": 10})
+
+        # Chroma에서 모든 문서/메타를 꺼내 BM25용 청크 재구성
+        try:
+            client = get_client(PERSIST_DIR_INFO)
+            col = get_collection(client, "langchain", EMBEDDING_MODEL)  # 컬렉션명은 실제 값 사용
+            ids, docs, metas = get_all(col)
+            all_chunks = [
+                Document(page_content=docs[i] or "", metadata=metas[i] or {})
+                for i in range(len(ids))
+                if (docs[i] or "").strip()
+            ]
+            if not all_chunks:
+                rag_logger.warning("⚠️ Existing Chroma loaded but no documents found; will try to (re)index from MD.")
+            else:
+                _retriever_cache["chunks"] = all_chunks
+                _retriever_cache["unified"] = chroma_r
+                rag_logger.info(f"✅ Unified Chroma loaded with {len(all_chunks)} chunks (rebuilt from collection).")
+                return chroma_r
+        except Exception as e:
+            rag_logger.warning(f"⚠️ Failed to rebuild chunks from existing Chroma: {e}. Will try reindexing from MD.")
+
+    # --- 2) 여기까지 왔다는 건 DB가 없거나, 청크 재구성이 실패한 경우 → MD로 청킹 ---
+    from app.core.config import PDF_FILES
+    all_pdf_paths = list(PDF_FILES.values())
+    all_chunks = process_documents(all_pdf_paths)
+
+    if not all_chunks:
+        # 기존엔 raise로 끊겼음 → 여기서 명확히 안내
+        raise ValueError("No chunks were generated from the documents. "
+                         "PDF_FILES 경로 또는 2025_*.md 파일 유무를 확인하세요.")
+
+    rag_logger.info(f"✅ Creating new ChromaDB at: {PERSIST_DIR_INFO}")
+    vector_vs = Chroma.from_documents(all_chunks, embedding=embeddings, persist_directory=PERSIST_DIR_INFO)
+    chroma_r = vector_vs.as_retriever(search_kwargs={"k": 10})
+    _retriever_cache["chunks"] = all_chunks
+    _retriever_cache["unified"] = chroma_r
+    rag_logger.info(f"✅ Unified Chroma index built with {len(all_chunks)} chunks!")
+    return chroma_r
 
 #--------------------------------------------
 # 공지사항
@@ -405,77 +573,110 @@ embeddings = HuggingFaceBgeEmbeddings(
     model_kwargs=model_kwargs,
     encode_kwargs=encode_kwargs
 )
-#  질의(Query) 기간 및 메타데이터 필터 로직
-def get_time_filter(query: str):
-    query = query.lower()
-    match = re.search(r"(\d+)\s*(주|달|개월|년)", query)
-    if match:
-        number = int(match.group(1))
-        unit = match.group(2)
-        if "주" in unit:
-            past_date = datetime.now() - timedelta(weeks=number)
-        elif "달" in unit or "개월" in unit:
-            past_date = datetime.now() - timedelta(days=number * 30)
-        elif "년" in unit:
-            past_date = datetime.now() - timedelta(days=number * 365)
-        else:
-            past_date = datetime.now() - timedelta(weeks=2)
-        return {"date": {"$gte": int(past_date.timestamp())}}
-    two_week_ago = datetime.now() - timedelta(weeks=2)
-    return {"date": {"$gte": int(two_week_ago.timestamp())}}
-
+# ---- 필드/별칭 매핑: 실제 메타데이터 키에 맞춤 ----
+#  * 실제 메타: college_name / department_name / notice_type / date / title / url ...
 metadata_mapping = {
     "공과대학": {"college_name": "공과대학", "aliases": ["공대"]},
     "소프트웨어융합대학": {"college_name": "소프트웨어융합대학", "aliases": ["소융대"]},
-    "첨단신소재공학과": {"department_name": "첨단신소재공학과", "aliases": ["첨신공"]},
+    "첨단신소재공학과": {"department_name": "첨단신소재공학과", "aliases": ["첨신공", "신소재"]},
     "건설시스템공학과": {"department_name": "건설시스템공학과", "aliases": ["건시공"]},
     "교통시스템공학과": {"department_name": "교통시스템공학과", "aliases": ["교시공"]},
-    "소프트웨어학과": {"department_name": "소프트웨어학과", "aliases": ["소프트웨어과","소웨"]},
+    "소프트웨어학과": {"department_name": "소프트웨어학과", "aliases": ["소프트웨어과","소웨", "소웨과"]},
     "환경안전공학과": {"department_name": "환경안전공학과", "aliases": []},
     "응용화학생명공학과": {"department_name": "응용화학생명공학과", "aliases": ["응화생"]},
     "응용화학공학과": {"department_name": "응용화학공학과", "aliases": ["화공과","화공"]},
-    "기계공학과": {"department_name": "기계공학과", "aliases": ["기계과"]},
+    "기계공학과": {"department_name": "기계공학과", "aliases": ["기계과", "꼐"]},
     "건축학과": {"department_name": "건축학과", "aliases": []},
-    "산업공학과": {"department_name": "산업공학과", "aliases": ["산공"]},
+    "산업공학과": {"department_name": "산업공학과", "aliases": ["산공", "산공과"]},
     "융합시스템공학과": {"department_name": "융합시스템공학과", "aliases": ["융시공"]},
     "국방디지털융합학과": {"department_name": "국방디지털융합학과", "aliases": ["국디융"]},
-    "디지털미디어학과": {"department_name": "디지털미디어학과", "aliases": ["디미과"]},
-    "사이버보안학과": {"department_name": "사이버보안학과", "aliases": []},
-    "인공지능융합학과": {"department_name": "인공지능융합학과", "aliases": ["인공지능과", "인공지능학과"]},
-    "일반공지": {"category": "일반공지", "aliases": ["일공"]},
-    "장학공지": {"category": "장학공지", "aliases": ["장학"]}
+    "디지털미디어학과": {"department_name": "디지털미디어학과", "aliases": ["디미과", "미디어", "미뎌", "미디어학과", "미디어"]},
+    "사이버보안학과": {"department_name": "사이버보안학과", "aliases": ["사보"]},
+    "인공지능융합학과": {"department_name": "인공지능융합학과", "aliases": ["인공지능과", "인공지능학과", "인지융"]},
+    "일반공지": {"category": "일반공지", "aliases": ["일공", "학사공지", "일반 공지"]},
+    "장학공지": {"category": "장학공지", "aliases": ["장학", "장학 공지"]}
 }
 
-def get_enhanced_filter(query: str):
-    filters = []
+def get_time_filter(query: str) -> dict:
+    """자연어 기간(주/달/개월/년) → timestamp 필터. 기본 2주 이내."""
+    query = query.lower()
+    m = re.search(r"(\d+)\s*(주|달|개월|년)", query)
+    if m:
+        n = int(m.group(1)); u = m.group(2)
+        if "주" in u:
+            past = datetime.now() - timedelta(weeks=n)
+        elif "달" in u or "개월" in u:
+            past = datetime.now() - timedelta(days=n*30)
+        elif "년" in u:
+            past = datetime.now() - timedelta(days=n*365)
+        else:
+            past = datetime.now() - timedelta(weeks=2)
+    else:
+        past = datetime.now() - timedelta(weeks=4)
+    return {"date": {"$gte": int(past.timestamp())}}
+
+def _normalize_chroma_where(where: Optional[dict]) -> Optional[dict]:
+    """
+    Chroma 최상위 where는 단일 조건이면 평문 dict,
+    다중이면 {'$and': [ ... ]}. '$and' 배열 길이 1은 금지라 언랩한다.
+    """
+    if not where:
+        return None
+    if "$and" in where and isinstance(where["$and"], list) and len(where["$and"]) == 1:
+        return where["$and"][0]
+    if "$or" in where and isinstance(where["$or"], list) and len(where["$or"]) == 1:
+        return where["$or"][0]
+    return where
+
+def get_enhanced_filter(query: str) -> Optional[dict]:
+    """
+    규칙:
+      - 조건 0개 → None
+      - 조건 1개 → 그 dict 그대로
+      - 조건 2개 이상 → {'$and':[...]}
+    키는 실제 컬렉션 메타 키(college_name, department_name, notice_type, date) 사용
+    """
     query_lower = query.lower()
-    date_filter = get_time_filter(query)
-    filters.append(date_filter)
+    conds = []
 
-    for official_name, meta_data in metadata_mapping.items():
-        search_terms = [official_name] + meta_data.get("aliases", [])
-        for term in search_terms:
-            if re.search(term, query_lower):
-                if "college_name" in meta_data:
-                    filters.append({"college_name": meta_data["college_name"]})
-                elif "department_name" in meta_data:
-                    filters.append({"department_name": meta_data["department_name"]})
-                elif "category" in meta_data:
-                    filters.append({"category": meta_data["category"]})
-                break
-    
-    return {"$and": filters}
+    # 1) 기간 필터(기본 2주)
+    conds.append(get_time_filter(query))
 
-# 리트리버 생성 함수 
-def dynamic_retriever(query: str, filter_dict: dict):
+    # 2) 조직/유형 매핑
+    for official, meta in metadata_mapping.items():
+        terms = [official] + meta.get("aliases", [])
+        if any(re.search(t, query_lower) for t in terms):
+            # meta 안의 실제 키 1개만 꺼낸다 (college_name / department_name / notice_type 중 하나)
+            for key in ("college_name", "department_name", "notice_type"):
+                if key in meta:
+                    conds.append({key: meta[key]})
+                    break
+            break
+
+    # 0,1,2+ 케이스 처리
+    if not conds:
+        return None
+    if len(conds) == 1:
+        return conds[0]
+    return {"$and": conds}
+
+def dynamic_retriever(query: str, filter_dict: Optional[dict]):
+    """공지 전용 Chroma 리트리버. 컬렉션명 명시 + where 정규화."""
+    from app.core.config import PERSIST_DIR_NOTICE, NOTICE_COLLECTION
+    print("[NOTICE] persist:", PERSIST_DIR_NOTICE, "collection:", NOTICE_COLLECTION)
     loaded_vectorstore = Chroma(
         persist_directory=PERSIST_DIR_NOTICE,
+        collection_name=NOTICE_COLLECTION,
         embedding_function=embeddings
     )
-    # k=5로 설정하여 최종 답변에 사용할 5개 문서를 바로 가져옵니다.
-    return loaded_vectorstore.as_retriever(
-        search_kwargs={"filter": filter_dict, "k": 5}
-    ).get_relevant_documents(query)
+    where = _normalize_chroma_where(filter_dict)  # 있으면 사용, 없으면 None
+    docs = loaded_vectorstore.as_retriever(
+        search_kwargs={"filter": where, "k": 5}
+    ).invoke(query)
 
+    print(f"[DEBUG] Retrieved {len(docs)} documents:")
+    for i, doc in enumerate(docs):
+        print(f"  {i + 1}. {doc.metadata.get('title')}")
+        print(f"      Content length: {len(getattr(doc, 'page_content', ''))}")
 
-
+    return docs
