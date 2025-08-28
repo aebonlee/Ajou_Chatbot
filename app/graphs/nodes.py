@@ -740,12 +740,18 @@ def node_answer(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 RETRIEVER_TOP_K = 7
-CONFIDENCE_THRESHOLD = 0.02
+CONFIDENCE_THRESHOLD = 0.5
 
 def retrieve_node(state: Dict[str, Any]):
     question = state["question"]
     departments = state.get("departments")
+    user_selected_list = state.get("user_selected_list")
     rag_logger.info(f"--- Retrieving for: '{question}' in {departments} ---")
+
+    enhanced_question = question
+    if user_selected_list:
+        context_keywords = ", ".join(user_selected_list)
+        enhanced_question = f"{context_keywords}에 대한 질문: {question}"
 
     chroma_r = get_cached_retrievers()
     search_kwargs = {"k": 10}
@@ -756,10 +762,10 @@ def retrieve_node(state: Dict[str, Any]):
             filter_query = {"$or": [{"source": dept} for dept in departments]}
         search_kwargs["filter"] = filter_query
 
-    chroma_results = chroma_r.invoke(question, **search_kwargs)
+    chroma_results = chroma_r.invoke(enhanced_question, **search_kwargs)
     all_chunks = get_all_cached_chunks()
     bm25_r = get_filtered_bm25_retriever(all_chunks, departments)
-    bm25_results = bm25_r.invoke(question)
+    bm25_results = bm25_r.invoke(enhanced_question)
 
     fused_results = weighted_reciprocal_rank_fusion(
         [chroma_results, bm25_results], weights=[0.5, 0.5], c=0
@@ -774,10 +780,17 @@ def retrieve_node(state: Dict[str, Any]):
 def generate_node(state: Dict[str, Any]):
     rag_logger.info("--- Generating Answer ---")
     context = format_docs([doc for doc, _ in state["documents"][:RETRIEVER_TOP_K]])
+    user_selected_list = state.get("user_selected_list", [])
 
+    # labels가 있을 경우, LLM에게 추가적인 힌트를 줌
+    user_focus_prompt = ""
+    if user_selected_list:
+        user_focus_prompt = (f"참고: 사용자는 특히 다음 주제에 관심이 있습니다: "
+                             f"{', '.join(user_selected_list)}. 이 주제와 관련된 내용을 중심으로 답변을 구성하세요.")
     system_prompt = (
         "당신은 아주대학교의 친근하고 도움이 되는 학사안내 도우미입니다. "
         "한국어로 친근하게 답변하며, 제공된 문서를 기반으로 정확한 정보를 안내합니다."
+        "주어진 컨텍스트에 학부생과 대학원의 규정이 모두 있다면, '학부생'의 규정을 중심으로 답변해야 합니다."
     )
 
     user_prompt = ChatPromptTemplate.from_messages([
@@ -785,15 +798,20 @@ def generate_node(state: Dict[str, Any]):
         ("user", """
 다음 문서들을 바탕으로 질문에 답변해주세요:
 
+<context>
 {context}
+</context>
 
 사용자 질문: {question}
+{user_focus}
 
 답변 형식:
-- "네, {질문 주제}에 대해 간략히 설명해 드릴게요!" 로 친근하게 시작
+- "네, [질문 내용]에 대해 간략히 설명해 드릴게요!" 로 친근하게 시작
+- 답변은 반드시 <context>에 있는 정보만을 사용
 - 번호나 불릿 포인트로 구조화된 답변 제공
 - 구체적인 수치나 조건이 있으면 명확히 제시
-- 마지막에 "자세한 내용은 '학칙' 또는 '대학생활안내'에서 확인하실 수 있습니다." 형태로 출처 안내
+- 답변의 맨 마지막에 답변의 근거가 된 출처를 종합하여 "더 자세한 내용은 [문서명] [페이지]에서 확인하실 수 있어요!" 형식의 한 문장으로 안내해야 합니다.
+- 컨텍스트에서 답변을 찾을 수 없다면, "죄송합니다, 제공된 문서에서는 질문에 대한 정보를 찾을 수 없습니다."라고만 답변하세요.
         """)
     ])
 
@@ -803,12 +821,12 @@ def generate_node(state: Dict[str, Any]):
         max_tokens=config.MAX_TOKENS,
     )
     chain = user_prompt | llm
-    result = chain.invoke({"context": context, "question": state["question"]})
+    result = chain.invoke({"context": context, "question": state["question"], "user_focus": user_focus_prompt})
     return {"answer": result.content}
 
 def fallback_node(state: Dict[str, Any]):
     rag_logger.info("--- Fallback Triggered ---")
-    reason = state.get("fallback_reason", "알 수 없는 이유")
+    reason = state.get("fallback_reason", "예상치 못한 오류입니다.")
     return {"answer": reason}
 
 def should_generate(state: Dict[str, Any]) -> str:
