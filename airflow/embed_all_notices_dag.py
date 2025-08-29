@@ -12,9 +12,10 @@ from dotenv import load_dotenv
 import psycopg2
 from airflow.models.dag import DAG
 from airflow.operators.python import PythonOperator
+from app.core.config import PERSIST_DIR_NOTICE,EMBEDDING_MODEL
 
 # .env 파일에서 환경 변수 불러오기
-load_dotenv("/home/ma/ICT/.env")
+load_dotenv()
 
 # 환경 변수 사용
 DB_HOST = os.getenv("DB_HOST")
@@ -22,8 +23,6 @@ DB_DATABASE = os.getenv("DB_DATABASE")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = os.getenv("DB_PORT")
-MODEL_NAME = "BAAI/bge-m3"
-PERSIST_DIRECTORY = "/home/ma/ICT/chroma_db"
 
 okt = Okt()
 def preprocess_text(text):
@@ -76,8 +75,8 @@ def embed_and_add_to_vector_db(**kwargs):
         }
         documents.append(Document(page_content=page_content, metadata=metadata))
 
-    embeddings = HuggingFaceBgeEmbeddings(model_name=MODEL_NAME, model_kwargs={'device': 'cpu'})
-    vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings)
+    embeddings = HuggingFaceBgeEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={'device': 'cpu'})
+    vectorstore = Chroma(persist_directory=PERSIST_DIR_NOTICE, embedding_function=embeddings)
     
     # 중복 삽입을 방지하기 위해 ID 필터링
     ids = [f"{doc.metadata['notice_type']}_{doc.metadata['notice_id']}" for doc in documents]
