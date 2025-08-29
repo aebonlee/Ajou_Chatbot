@@ -1,0 +1,65 @@
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  SIGSEGV (0xb) at pc=0x000073251830147c, pid=3817, tid=3868
+#
+# JRE version: OpenJDK Runtime Environment (17.0.16+8) (build 17.0.16+8-Ubuntu-0ubuntu124.04.1)
+# Java VM: OpenJDK 64-Bit Server VM (17.0.16+8-Ubuntu-0ubuntu124.04.1, mixed mode, sharing, tiered, compressed oops, compressed class ptrs, g1 gc, linux-amd64)
+# Problematic frame:
+# C  [_special_ufuncs.cpython-312-x86_64-linux-gnu.so+0x5547c]  std::vector<xsf::numpy::ufunc_overloads, std::allocator<xsf::numpy::ufunc_overloads> >::~vector()+0x3c
+#
+# Core dump will be written. Default location: Core dumps may be processed with "/usr/share/apport/apport -p%p -s%s -c%c -d%d -P%P -u%u -g%g -F%F -- %E" (or dumping to /home/ma/ICT/Ajou_Chatbot/core.3817)
+#
+# If you would like to submit a bug report, please visit:
+#   https://bugs.launchpad.net/ubuntu/+source/openjdk-17
+#
+
+---------------  S U M M A R Y ------------
+
+Command Line: -Dfile.encoding=UTF8 -ea -Xmx1024m 
+
+Host: Intel(R) Core(TM) i3-7100U CPU @ 2.40GHz, 2 cores, 3G, Ubuntu 24.04.3 LTS
+Time: Fri Aug 29 17:11:26 2025 KST elapsed time: 9.875500 seconds (0d 0h 0m 9s)
+
+---------------  T H R E A D  ---------------
+
+Current thread (0x000000001d627cf0):  VMThread "VM Thread" [stack: 0x00007325297f9000,0x00007325298f9000] [id=3868]
+
+Stack: [0x00007325297f9000,0x00007325298f9000],  sp=0x00007325298f7870,  free space=1018k
+Native frames: (J=compiled Java code, j=interpreted, Vv=VM code, C=native code)
+C  [_special_ufuncs.cpython-312-x86_64-linux-gnu.so+0x5547c]  std::vector<xsf::numpy::ufunc_overloads, std::allocator<xsf::numpy::ufunc_overloads> >::~vector()+0x3c
+
+
+siginfo: si_signo: 11 (SIGSEGV), si_code: 1 (SEGV_MAPERR), si_addr: 0x0000000000000008
+
+Registers:
+RAX=0x0000000000000000, RBX=0x0000000000000001, RCX=0x0000000000000000, RDX=0x0000000000000003
+RSP=0x00007325298f7870, RBP=0x000000001de326a0, RSI=0x000000001dbe5480, RDI=0x000073265bc03ad8
+R8 =0x000000000001dbe5, R9 =0x0000000000000007, R10=0x000000001dbe5490, R11=0xf5380962709ba16c
+R12=0x000000001de326d0, R13=0x000073251840e960, R14=0x0000000000000082, R15=0x0000000018a6cb30
+RIP=0x000073251830147c, EFLAGS=0x0000000000010202, CSGSFS=0x002b000000000033, ERR=0x0000000000000004
+  TRAPNO=0x000000000000000e
+
+XMM[0]=0x0000000000000000 0x0000000000000000
+XMM[1]=0x0000000000000000 0x000073265bc03b20
+XMM[2]=0xffffffffffffffff 0xffffffffffffffff
+XMM[3]=0x2864656373656c61 0x6f635f726f736e65
+XMM[4]=0xffffffffffffffff 0xffffffffffffffff
+XMM[5]=0xffffffffffffffff 0xffffffffffffffff
+XMM[6]=0xffffffffffffffff 0xffffffffffffffff
+XMM[7]=0xffffffffffffffff 0xffffffffffffffff
+XMM[8]=0x1429296706ca6351 0xd5a79147c6e00bf3
+XMM[9]=0xbf597fc7b00327c8 0xa831c66d983e5152
+XMM[10]=0x76f988da5cb0a9dc 0x4a7484aa2de92c6f
+XMM[11]=0x240ca1cc0fc19dc6 0xefbe4786e49b69c1
+XMM[12]=0xc19bf1749bdc06a7 0x80deb1fe72be5d74
+XMM[13]=0x550c7dc3243185be 0x12835b01d807aa98
+XMM[14]=0xab1c5ed5923f82a4 0x59f111f13956c25b
+XMM[15]=0x0000000000000000 0x0000000000000000
+  MXCSR=0x00001fab
+
+
+Register to memory mapping:
+
+RAX=0x0 is NULL
+RBX=
