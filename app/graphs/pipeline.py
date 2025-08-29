@@ -3,7 +3,6 @@ from langgraph.graph import StateGraph, END
 from .state import GraphState, GraphStateInfo
 from .nodes import node_parse_intent, node_need_more, node_retrieve, node_build_context, node_answer, retrieve_node, \
     generate_node, fallback_node, should_generate
-from langchain_core.runnables import RunnableConfig
 from .nodes_classify import node_classify
 from app.core import config
 from langchain_core.prompts import ChatPromptTemplate

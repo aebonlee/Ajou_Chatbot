@@ -322,11 +322,11 @@ def _summarize_sources(hits: List[Dict[str, Any]], max_items: int = 8) -> str:
             unique_sources.append(simplified)
 
     if len(unique_sources) == 1:
-        return f'자세한 내용은 "{unique_sources[0]}"에서 확인할 수 있습니다.'
+        return f'자세한 내용은 학사요람의 "{unique_sources[0]}" 항목에서 확인할 수 있습니다.'
     elif len(unique_sources) <= 3:
-        return f'자세한 내용은 "{", ".join(unique_sources)}" 등에서 확인할 수 있습니다.'
+        return f'자세한 내용은 학사요람의 "{", ".join(unique_sources)}" 항목 등에서 확인할 수 있습니다.'
     else:
-        return f'자세한 내용은 "{unique_sources[0]}" 등 관련 문서에서 확인할 수 있습니다.'
+        return f'자세한 내용은 학사요람의 "{unique_sources[0]}" 항목 등 관련 문서에서 확인할 수 있습니다.'
 
 def _build_context_from_hits(hits: List[Dict[str, Any]], *, max_items: int, budget_chars: int) -> str:
     """
