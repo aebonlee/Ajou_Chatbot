@@ -152,26 +152,22 @@ def get_cached_pipeline():
     return app
 
 
-def route_query_sync(question: str, departments: List[str] = None, session_id: str = "default"):
+def route_query_sync(question: str, departments: List[str] = None, selected_list: List[str] = None):
     """
     그래프를 동기적으로 실행하는 함수.
     departments 리스트를 받아 메타데이터 필터링을 수행합니다.
     """
     if departments is None:
         departments = []
-
-    # get_cached_pipeline()은 이제 모든 요청에 대해 동일한 그래프를 반환해야 합니다.
     app = get_cached_pipeline()
-    config = RunnableConfig(configurable={"session_id": session_id})
 
-    # GraphState에 맞게 'question'과 'departments'를 전달합니다.
-    inputs = {"question": question, "departments": departments}
+    inputs = {"question": question, "departments": departments, "user_selected_list": selected_list}
 
-    final_state = app.invoke(inputs, config=config)
+    final_state = app.invoke(inputs)
 
     return {
         "answer": final_state.get("answer", "오류가 발생했습니다."),
-        "documents": final_state.get("documents", [])  # 디버깅을 위해 검색된 문서도 반환
+        "documents": final_state.get("documents", [])
     }
 
 

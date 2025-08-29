@@ -1,5 +1,5 @@
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class QueryRequest(BaseModel):
     question: str
@@ -48,11 +48,28 @@ class RouteSchema(BaseModel):
 # --------------------------------------------
 # 학사공통
 # -------------------------------------------
+INFO_NAME_MAP = {
+    "학칙": "rules",
+    "학사력": "overview",
+    "대학생활안내": "campus_life"
+}
+
 
 class InfoRequest(BaseModel):
     question: str
-    selected_list: List[str] = []  # corpus_type (rules, overview, campus_life)
+    departments: List[str] = []  # corpus_type (rules, overview, campus_life)
+    selected_list: List[str] = []
 
+    @field_validator('departments', mode='before')
+    @classmethod
+    def translate_departments(cls, value: List[str]) -> List[str]:
+        translated_list = []
+        for kor_name in value:
+            system_id = INFO_NAME_MAP.get(kor_name)
+            if system_id is None:
+                raise ValueError(f"'{kor_name}'은(는) 유효한 department가 아닙니다.")
+            translated_list.append(system_id)
+        return translated_list
 
 class InfoResponse(BaseModel):
     answer: str

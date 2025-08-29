@@ -407,11 +407,8 @@ def retrieve(
 TOKENIZER = Okt()
 model_name = "BAAI/bge-m3"
 
-# --- GPU 자동 감지 로직 ---
-# torch.cuda.is_available()가 GPU의 존재 여부를 확인합니다.
 device = "cuda" if torch.cuda.is_available() else "cpu"
 rag_logger.info(f"✅ Using device: {device}")
-# ---
 
 model_kwargs = {'device': device}
 encode_kwargs = {'normalize_embeddings': True}
@@ -487,23 +484,30 @@ def weighted_reciprocal_rank_fusion(
     final_sorted_docs = [(content_to_document[content], score) for content, score in sorted_results]
     return final_sorted_docs
 
+# 예: 최종 답변 출처 표시용
+INFO_SOURCE_MAP = {
+    "rules": "학칙",
+    "overview": "학사력",
+    "campus_life": "대학생활안내"
+}
+
 def format_docs(docs, max_chars: int = 1800) -> str:
+    """
+    LLM이 출처를 명확하게 인식하고 그대로 복사할 수 있도록
+    각 문서 청크에 [출처: 문서ID, 페이지: 숫자] 태그를 붙여줍니다.
+    """
     out = []
-    for i, d in enumerate(docs, 1):
-        src = d.metadata.get("title", d.metadata.get("source", "doc"))
+    for d in docs:
+        # 'source'는 'rules', 'campus_life' 등
+        src = d.metadata.get("source", "unknown")
+        title = INFO_SOURCE_MAP.get(src, src)
         page = d.metadata.get("page", "?")
+        citation_tag = f"[출처: {title}, p.{page}]"
         body = d.page_content[:max_chars].replace("\u200b", "").strip()
-        out.append(f"[{i}] {src}, page={page}\n{body}")
+        out.append(f"{citation_tag}\n{body}")
+
     return "\n\n---\n\n".join(out)
 
-def load_chroma(persistent_dir: str, chunks: List) -> Chroma:
-    if os.path.exists(persistent_dir) and len(os.listdir(persistent_dir)) > 0:
-        rag_logger.info(f"✅ Loading existing ChromaDB from: {persistent_dir}")
-        return Chroma(persist_directory=persistent_dir, embedding_function=embeddings)
-
-    rag_logger.info(f"✅ Creating new ChromaDB at: {persistent_dir}")
-    vs = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=persistent_dir)
-    return vs
 
 def get_cached_retrievers():
     """

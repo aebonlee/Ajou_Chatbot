@@ -31,12 +31,12 @@ class GraphStateInfo(TypedDict, total=False):
     # 필수 입력
     question: str
     departments: List[str]
+    user_selected_list: List[str]
 
-    # 검색 결과 및 신뢰도 (명시적으로 추가)
+    # 검색 결과 및 신뢰도
     documents: List[Tuple[Document, float]]
     retrieval_success: bool
     top_score: float
-    fallback_reason: str  # 왜 fallback이 되었는지 이유
+    fallback_reason: str
 
-    # 최종 결과
     answer: str
